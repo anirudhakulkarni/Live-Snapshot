@@ -31,7 +31,7 @@ name = "arch"
 version = "0.1.0"
 dependencies = [
  "vm-fdt",
- "vm-memory",
+ "vm-memory 0.7.0",
 ]
 
 [[package]]
@@ -149,7 +149,7 @@ dependencies = [
  "virtio-device",
  "virtio-queue",
  "vm-device",
- "vm-memory",
+ "vm-memory 0.7.0",
  "vm-superio",
  "vmm-sys-util",
 ]
@@ -364,7 +364,7 @@ name = "linux-loader"
 version = "0.4.0"
 source = "git+https://github.com/rust-vmm/linux-loader.git?rev=9a9f071#9a9f071219a8c74dcd703aec40ba0249e3a5993b"
 dependencies = [
- "vm-memory",
+ "vm-memory 0.7.0",
 ]
 
 [[package]]
@@ -907,7 +907,7 @@ dependencies = [
  "log",
  "virtio-device",
  "virtio-queue",
- "vm-memory",
+ "vm-memory 0.7.0",
  "vmm-sys-util",
 ]
 
@@ -918,7 +918,7 @@ source = "git+https://github.com/rust-vmm/vm-virtio.git#d8ef45f57b46baa99e80e555
 dependencies = [
  "log",
  "virtio-queue",
- "vm-memory",
+ "vm-memory 0.7.0",
 ]
 
 [[package]]
@@ -927,7 +927,7 @@ version = "0.2.0"
 source = "git+https://github.com/rust-vmm/vm-virtio.git#d8ef45f57b46baa99e80e555deffd3fa1ab9affc"
 dependencies = [
  "log",
- "vm-memory",
+ "vm-memory 0.7.0",
  "vmm-sys-util",
 ]
 
@@ -942,6 +942,15 @@ name = "vm-fdt"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f43fb5a6bd1a7d423ad72802801036719b7546cf847a103f8fe4575f5b0d45a6"
+
+[[package]]
+name = "vm-memory"
+version = "0.3.0"
+dependencies = [
+ "libc",
+ "utils",
+ "vm-memory 0.7.0",
+]
 
 [[package]]
 name = "vm-memory"
@@ -973,7 +982,7 @@ dependencies = [
  "versionize",
  "versionize_derive",
  "vm-device",
- "vm-memory",
+ "vm-memory 0.7.0",
  "vm-vcpu-ref",
  "vmm-sys-util",
 ]
@@ -986,7 +995,7 @@ dependencies = [
  "kvm-ioctls",
  "libc",
  "thiserror",
- "vm-memory",
+ "vm-memory 0.7.0",
  "vmm-sys-util",
 ]
 
@@ -1006,7 +1015,7 @@ dependencies = [
  "versionize",
  "versionize_derive",
  "vm-device",
- "vm-memory",
+ "vm-memory 0.3.0",
  "vm-superio",
  "vm-vcpu",
  "vm-vcpu-ref",

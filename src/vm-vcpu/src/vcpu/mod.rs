@@ -726,11 +726,12 @@ impl KvmVcpu {
         self.init_tls()?;
 
         self.run_barrier.wait();
+        println!("Going into cpu run");
         'vcpu_run: loop {
             let mut interrupted_by_signal = false;
             match self.vcpu_fd.run() {
                 Ok(exit_reason) => {
-                    // println!("{:#?}", exit_reason);
+                    println!("{:#?}", exit_reason);
                     match exit_reason {
                         VcpuExit::Shutdown | VcpuExit::Hlt => {
                             println!("Guest shutdown: {:?}. Bye!", exit_reason);

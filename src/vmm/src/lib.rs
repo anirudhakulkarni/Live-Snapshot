@@ -19,6 +19,7 @@ use kvm_ioctls::{
     Cap::{self, Ioeventfd, Irqchip, Irqfd, UserMemory},
     Kvm,
 };
+use libc::mmap;
 use linux_loader::cmdline;
 #[cfg(target_arch = "x86_64")]
 use linux_loader::configurator::{
@@ -44,7 +45,7 @@ use vm_device::device_manager::MmioManager;
 use vm_device::device_manager::PioManager;
 #[cfg(target_arch = "aarch64")]
 use vm_memory::GuestMemoryRegion;
-use vm_memory::{GuestAddress, GuestMemory, GuestMemoryMmap, FileOffset};
+use vm_memory::{GuestAddress, GuestMemory, GuestMemoryMmap, FileOffset, Bytes, MemoryRegionAddress, };
 #[cfg(target_arch = "x86_64")]
 use vm_superio::I8042Device;
 #[cfg(target_arch = "aarch64")]
@@ -61,13 +62,16 @@ pub use config::*;
 use devices::virtio::block::{self, BlockArgs};
 use devices::virtio::net::{self, NetArgs};
 use devices::virtio::{Env, MmioConfig};
+pub mod memory_snapshot;
 
+use crate::memory_snapshot::{GuestMemoryState, GuestMemoryRegionState, SnapshotMemory, };
 
+// use memory_snapshot::{GuestMemoryRegionState, GuestMemoryState};
 #[cfg(target_arch = "x86_64")]
 use devices::legacy::I8042Wrapper;
 use devices::legacy::{EventFdTrigger, SerialWrapper};
 use vm_vcpu::vm::{self, ExitHandler, KvmVm, VmConfig, VmState, VmRunState};
-
+use vm_memory::GuestMemoryRegion;
 #[cfg(target_arch = "aarch64")]
 use devices::legacy::RtcWrapper;
 
@@ -259,6 +263,34 @@ struct VmmExitHandler {
     keep_running: AtomicBool,
 }
 
+// /// Dumps all contents of GuestMemoryMmap to a writer.
+// fn dump<T: std::io::Write>( guest_memory: &GuestMemoryMmap , writer: &mut T)  {
+//     guest_memory.iter()
+//         .try_for_each(|region| {
+//             region.write_all_to(MemoryRegionAddress(0), writer, region.len() as usize)
+//         }).unwrap();
+//         // .map_err(Error::)
+// }
+
+fn get_memory_state(size: usize) -> GuestMemoryState{
+    let region_state = GuestMemoryRegionState {
+        base_address: 0,
+        size: size,
+        offset: 0,
+    };
+
+    GuestMemoryState {
+        regions: vec![region_state]
+    }
+}
+
+// fn restore(file: File, size: usize) -> GuestMemoryMmap {
+//     let ranges = vec![
+//         (GuestAddress(0), size, Some(FileOffset::new(file, 0))),
+//     ];
+
+//     GuestMemoryMmap::from_ranges_with_files(ranges).unwrap()
+// }
 // The wrapped exit handler is needed because the ownership of the inner `VmmExitHandler` is
 // shared between the `KvmVm` and the `EventManager`. Clone is required for implementing the
 // `ExitHandler` trait.
@@ -349,17 +381,31 @@ impl TryFrom<VMMConfig> for Vmm {
         
         let guest_memory;
         let mut is_resume = false;
+        let mem_size = ((config.memory_config.size_mib as u64) << 20) as usize;
         
         let my_vm = if config.snapshot_config.is_none() {
-            let mem_size = ((config.memory_config.size_mib as u64) << 20) as usize;
-            create_file(mem_path, mem_size);
-            guest_memory = Vmm::create_guest_memory(mem_path,&config.memory_config)?;
-            KvmVm::new(
+
+            let mem_regions = vec![
+                (None, GuestAddress(0), mem_size)
+            ];
+            guest_memory = vm_memory::create_guest_memory(&mem_regions[..], true).unwrap();
+            let mut vm = KvmVm::new(
                 &kvm,
                 vm_config,
                 &guest_memory,
                 wrapped_exit_handler.clone(),
                 device_mgr.clone()
+            ).unwrap();
+
+            let mut vm_state = vm.save_state_tmp().unwrap();
+            Self::save_cpu("temp_cpu.txt", &vm_state);
+            vm_state = Self::restore_cpu("temp_cpu.txt");
+            KvmVm::from_state(
+                &kvm,
+                vm_state,
+                &guest_memory,
+                wrapped_exit_handler.clone(),
+                device_mgr.clone(),
             ).unwrap()
         } else{
             // resume
@@ -369,9 +415,16 @@ impl TryFrom<VMMConfig> for Vmm {
 
             println!("restoring snapshot");
             let vmstate= Self::restore_cpu(&cpu_snapshot_path[..]);
-            std::fs::copy(memory_snapshot_path, mem_path).unwrap();
-            guest_memory = Vmm::create_guest_memory(mem_path,&config.memory_config)?;
-            println!("snapshot taken");
+            // guest_memory = GuestMemoryMmap::restore(Some(memory_file.as_file()), &memory_state, false);
+
+            let memory_state = get_memory_state(mem_size);
+            let file = File::options()
+                        .write(true)
+                        .read(true)
+                        .open(memory_snapshot_path)
+                        .unwrap();
+            guest_memory = GuestMemoryMmap::restore(Some(&file), &memory_state, false);
+            println!("snapshot restored");
 
             KvmVm::from_state(
                 &kvm,
@@ -381,6 +434,7 @@ impl TryFrom<VMMConfig> for Vmm {
                 device_mgr.clone(),
             ).unwrap()
         };
+
 
         let mut vmm = Vmm {
             vm: my_vm,
@@ -448,7 +502,7 @@ impl Vmm {
 
         // FIXME: 3. Serialize memory and vcpus -> Save to disk in supplied file name
         let vm_state = self.vm.save_state().unwrap();
-        Self::take_snapshot(snapshot_path, memory_snapshot_path, &vm_state);
+        Self::take_snapshot(snapshot_path, memory_snapshot_path, &vm_state, &self.guest_memory);
         // mut self.save_snapshot_helper(&cpu_snapshot_path).unwrap();
         // Self::save_snapshot_helper(&snapshot_path[..], &memory_snapshot_path[..]).unwrap();
         // FIXME: issue here is to get mutable reference to self.
@@ -479,7 +533,7 @@ impl Vmm {
         }
 
         let vm_state = self.vm.save_state().unwrap();
-        Self::take_snapshot(snapshot_path, memory_snapshot_path, &vm_state);
+        Self::take_snapshot(snapshot_path, memory_snapshot_path, &vm_state, &self.guest_memory);
         // FIXME: 2. Saving the vcpu state for all vcpus once all have came out -> Do it in VMM
         // let vcpu_state = self.vm.save_state().unwrap();
         // self.save_snapshot_helper(&snapshot_path[..], &memory_snapshot_path[..]).unwrap();
@@ -491,12 +545,19 @@ impl Vmm {
         
     }
 
-    pub fn take_snapshot(snapshot_path: &str, memory_path: &str, vm_state: &VmState) {
+    pub fn take_snapshot(snapshot_path: &str, memory_path: &str, vm_state: &VmState, guest_memory: &GuestMemoryMmap) {
         Self::save_cpu(snapshot_path, vm_state);
-        // close memory file before saving
-        // let fd = 9;
-        // let _ = unsafe { libc::close(fd) };
-        std::fs::copy("memory.txt", memory_path);
+        
+        // std::fs::copy("memory.txt", memory_path);
+        let mut writer = File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(memory_path)
+            .unwrap();
+        SnapshotMemory::dump(guest_memory, &mut writer);
+        writer.flush().unwrap();
+        writer.sync_all().unwrap();
     }
 
     ///
@@ -574,20 +635,21 @@ impl Vmm {
 
     /// Run the VMM.
     pub fn run(&mut self) -> Result<()> {
-        let load_result = self.load_kernel()?;
-        #[cfg(target_arch = "x86_64")]
-        let kernel_load_addr = self.compute_kernel_load_addr(&load_result)?;
-        // let kernel_load_addr = GuestAddress(1049088);
-        #[cfg(target_arch = "aarch64")]
-        let kernel_load_addr = load_result.kernel_load;
 
-        #[cfg(target_arch = "aarch64")]
-        self.setup_fdt()?;
-        if stdin().lock().set_raw_mode().is_err() {
-            eprintln!("Failed to set raw mode on terminal. Stdin will echo.");
+        let kernel_load_addr ;
+        if !self.is_resume {
+            let load_result = self.load_kernel()?;
+            kernel_load_addr = self.compute_kernel_load_addr(&load_result)?;
+            // let kernel_load_addr = GuestAddress(1049088);
+            if stdin().lock().set_raw_mode().is_err() {
+                eprintln!("Failed to set raw mode on terminal. Stdin will echo.");
+            }
+        }
+        else{
+            kernel_load_addr = GuestAddress(0);
         }
 
-        
+        println!("FLOW: Starting VM");        
         self.vm.run(Some(kernel_load_addr), self.is_resume).map_err(Error::Vm)?;
         
         loop {
@@ -617,48 +679,40 @@ impl Vmm {
                 break;
             }
         }
+        println!("FLOW: VM stopped");
         self.vm.shutdown();
 
         Ok(())
     }
 
 
-    // Create guest memory regions.
-    fn create_guest_memory(path: &str, memory_config: &MemoryConfig) -> Result<GuestMemoryMmap> {
-        let mem_size = ((memory_config.size_mib as u64) << 20) as usize;
-        let mem_regions = Vmm::create_memory_regions(path, mem_size);
+    // // Create guest memory regions.
+    // fn create_guest_memory(memory_config: &MemoryConfig) -> Result<GuestMemoryMmap> {
+    //     let mem_size = ((memory_config.size_mib as u64) << 20) as usize;
+    //     let mem_regions = Vmm::create_memory_regions(mem_size);
 
-        // Create guest memory from regions.
-        // GuestMemoryMmap::from_ranges(&mem_regions)
-        //     .map_err(|e| Error::Memory(MemoryError::VmMemory(e)))
-        GuestMemoryMmap::from_ranges_with_files(
-            mem_regions
-        )
-        .map_err(|e| Error::Memory(MemoryError::VmMemory(e)))
-    }
+    //     // Create guest memory from regions.
+    //     GuestMemoryMmap::from_ranges(&mem_regions)
+    //         .map_err(|e| Error::Memory(MemoryError::VmMemory(e)))
+    // }
 
-    fn create_memory_regions(path: &str, mem_size: usize) -> Vec<(GuestAddress, usize, Option<FileOffset>)> {
-        #[cfg(target_arch = "x86_64")]
-        // On x86_64, they surround the MMIO gap (dedicated space for MMIO device slots) if the
-        // configured memory size exceeds the latter's starting address.
+    // fn create_memory_regions(mem_size: usize) -> Vec<(GuestAddress, usize)> {
+    //     #[cfg(target_arch = "x86_64")]
+    //     // On x86_64, they surround the MMIO gap (dedicated space for MMIO device slots) if the
+    //     // configured memory size exceeds the latter's starting address.
+    //     match mem_size.checked_sub(MMIO_GAP_START as usize) {
+    //         // Guest memory fits before the MMIO gap.
+    //         None | Some(0) => vec![(GuestAddress(0), mem_size)],
+    //         // Guest memory extends beyond the MMIO gap.
+    //         Some(remaining) => vec![
+    //             (GuestAddress(0), MMIO_GAP_START as usize),
+    //             (GuestAddress(MMIO_GAP_END), remaining),
+    //         ],
+    //     }
 
-        
-        match mem_size.checked_sub(MMIO_GAP_START as usize) {
-            // Guest memory fits before the MMIO gap.
-            None | Some(0) =>
-                vec![(GuestAddress(0), mem_size, Some(Self::get_file_offset(path).unwrap()))],
-            // Guest memory extends beyond the MMIO gap.
-            Some(remaining) => 
-            vec![
-                (GuestAddress(0), MMIO_GAP_START as usize, Some(Self::get_file_offset(path).unwrap())),
-                // FIXME: path wrong
-                (GuestAddress(MMIO_GAP_END), remaining, Some(Self::get_file_offset(path).unwrap())),
-            ],
-        }
-
-        #[cfg(target_arch = "aarch64")]
-        vec![(GuestAddress(AARCH64_PHYS_MEM_START), mem_size)]
-    }
+    //     #[cfg(target_arch = "aarch64")]
+    //     vec![(GuestAddress(AARCH64_PHYS_MEM_START), mem_size)]
+    // }
 
     fn get_file_offset(name: &str) ->  Result<FileOffset> {
         let f = File::options()

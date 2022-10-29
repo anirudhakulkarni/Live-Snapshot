@@ -617,6 +617,59 @@ impl<EH: 'static + ExitHandler + Send> KvmVm<EH> {
             vcpus_state,
         })
     }
+
+    #[cfg(target_arch = "x86_64")]
+    pub fn save_state_tmp(&mut self) -> Result<VmState> {
+        use std::{fs::File, io::Read};
+
+        let pitstate = self.fd.get_pit2().map_err(Error::VmGetPit2)?;
+
+        let mut clock = self.fd.get_clock().map_err(Error::VmGetClock)?;
+        // This bit is not accepted in SET_CLOCK, clear it.
+        clock.flags &= !KVM_CLOCK_TSC_STABLE;
+
+        let mut pic_master = kvm_irqchip {
+            chip_id: KVM_IRQCHIP_PIC_MASTER,
+            ..Default::default()
+        };
+        self.fd
+            .get_irqchip(&mut pic_master)
+            .map_err(Error::VmGetIrqChip)?;
+
+        let mut pic_slave = kvm_irqchip {
+            chip_id: KVM_IRQCHIP_PIC_SLAVE,
+            ..Default::default()
+        };
+        self.fd
+            .get_irqchip(&mut pic_slave)
+            .map_err(Error::VmGetIrqChip)?;
+
+        let mut ioapic = kvm_irqchip {
+            chip_id: KVM_IRQCHIP_IOAPIC,
+            ..Default::default()
+        };
+        self.fd
+            .get_irqchip(&mut ioapic)
+            .map_err(Error::VmGetIrqChip)?;
+
+        let vcpus_state = self
+            .vcpus
+            .iter_mut()
+            .map(|vcpu| vcpu.save_state())
+            .collect::<vcpu::Result<Vec<VcpuState>>>()
+            .map_err(Error::SaveVcpuState)?;
+    
+
+        Ok(VmState {
+            pitstate,
+            clock,
+            pic_master,
+            pic_slave,
+            ioapic,
+            config: self.config.clone(),
+            vcpus_state,
+        })
+    }
 }
 
 // #[cfg(test)]
