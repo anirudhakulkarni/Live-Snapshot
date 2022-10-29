@@ -9,6 +9,8 @@ use std::io::{self, stdin};
 use std::os::raw::c_int;
 use std::result;
 use std::sync::{Arc, Barrier, Condvar, Mutex};
+use versionize::{VersionMap, Versionize, VersionizeResult};
+use versionize_derive::Versionize;
 
 #[cfg(target_arch = "x86_64")]
 use kvm_bindings::{
@@ -211,7 +213,7 @@ pub enum Error {
 /// Dedicated Result type.
 pub type Result<T> = result::Result<T, Error>;
 
-#[derive(Clone)]
+#[derive(Clone,Versionize)]
 pub struct VcpuConfig {
     pub id: u8,
     #[cfg(target_arch = "x86_64")]
@@ -222,7 +224,7 @@ pub struct VcpuConfig {
     pub msrs: Msrs,
 }
 
-#[derive(Clone)]
+#[derive(Clone,Versionize)]
 pub struct VcpuConfigList {
     pub configs: Vec<VcpuConfig>,
 }
@@ -268,7 +270,7 @@ impl VcpuConfigList {
 
 /// Structure holding the kvm state for an x86_64 VCPU.
 #[cfg(target_arch = "x86_64")]
-#[derive(Clone)]
+#[derive(Clone, Versionize)]
 pub struct VcpuState {
     pub cpuid: CpuId,
     pub msrs: Msrs,

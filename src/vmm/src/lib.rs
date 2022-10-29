@@ -7,7 +7,7 @@ use std::convert::TryFrom;
 #[cfg(target_arch = "aarch64")]
 use std::convert::TryInto;
 use std::fs::File;
-use std::io::{self, stdin, stdout};
+use std::io::{self, stdin, stdout, Read};
 use std::ops::DerefMut;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -44,7 +44,7 @@ use vm_device::device_manager::MmioManager;
 use vm_device::device_manager::PioManager;
 #[cfg(target_arch = "aarch64")]
 use vm_memory::GuestMemoryRegion;
-use vm_memory::{GuestAddress, GuestMemory, GuestMemoryMmap};
+use vm_memory::{GuestAddress, GuestMemory, GuestMemoryMmap, FileOffset};
 #[cfg(target_arch = "x86_64")]
 use vm_superio::I8042Device;
 #[cfg(target_arch = "aarch64")]
@@ -62,7 +62,7 @@ use devices::virtio::{Env, MmioConfig};
 #[cfg(target_arch = "x86_64")]
 use devices::legacy::I8042Wrapper;
 use devices::legacy::{EventFdTrigger, SerialWrapper};
-use vm_vcpu::vm::{self, ExitHandler, KvmVm, VmConfig};
+use vm_vcpu::vm::{self, ExitHandler, KvmVm, VmConfig, VmState};
 
 #[cfg(target_arch = "aarch64")]
 use devices::legacy::RtcWrapper;
@@ -72,6 +72,10 @@ use arch::{FdtBuilder, AARCH64_FDT_MAX_SIZE, AARCH64_MMIO_BASE, AARCH64_PHYS_MEM
 
 mod boot;
 mod config;
+
+use versionize::{VersionMap, Versionize, VersionizeResult};
+use versionize_derive::Versionize;
+use std::io::Write;
 
 /// First address past 32 bits is where the MMIO gap ends.
 pub(crate) const MMIO_GAP_END: u64 = 1 << 32;
@@ -244,6 +248,15 @@ impl MutEventSubscriber for VmmExitHandler {
     }
 }
 
+
+fn create_file(name: &str, mem_size: usize) {
+
+    // TODO: Do it with create
+    let mut f = File::create(name).unwrap();
+    f.set_len(mem_size as u64);
+}
+
+
 impl TryFrom<VMMConfig> for Vmm {
     type Error = Error;
 
@@ -257,14 +270,22 @@ impl TryFrom<VMMConfig> for Vmm {
         }
         Vmm::check_kvm_capabilities(&kvm)?;
 
-        let guest_memory = Vmm::create_guest_memory(&config.memory_config)?;
+        let mem_path = "memory.txt";
+        // create memory from scratch
+        let mem_size = ((config.memory_config.size_mib as u64) << 20) as usize;
+        create_file(mem_path, mem_size);
+
+        //resume snapshot of memory
+        // std::fs::copy("mem.txt","memory.txt").unwrap();
+
+        let guest_memory = Vmm::create_guest_memory(mem_path,&config.memory_config)?;
         let device_mgr = Arc::new(Mutex::new(IoManager::new()));
 
         // Create the KvmVm.
         let vm_config = VmConfig::new(&kvm, config.vcpu_config.num)?;
 
         let wrapped_exit_handler = WrappedExitHandler::new()?;
-        let vm = KvmVm::new(
+        let mut vm = KvmVm::new(
             &kvm,
             vm_config,
             &guest_memory,
@@ -276,8 +297,22 @@ impl TryFrom<VMMConfig> for Vmm {
             .map_err(Error::EventManager)?;
         event_manager.add_subscriber(wrapped_exit_handler.0.clone());
 
+        // save vm
+        let my_vmstate = vm.save_state().unwrap(); 
+        Self::save_cpu("cc.txt", &my_vmstate);
+        let mut vmstate= Self::restore_cpu("cc.txt");
+        
+        let my_vm = KvmVm::from_state(
+            &kvm,
+            vmstate,
+            &guest_memory,
+            wrapped_exit_handler.clone(),
+            device_mgr.clone(),
+        )?;
+        
+
         let mut vmm = Vmm {
-            vm,
+            vm:my_vm,
             guest_memory,
             device_mgr,
             event_mgr: event_manager,
@@ -309,11 +344,73 @@ impl TryFrom<VMMConfig> for Vmm {
 }
 
 impl Vmm {
+    ///
+    pub fn save_cpu( snapshot_path: &str, vm_state: &VmState)  {
+
+        let mut snapshot_file = File::create(snapshot_path).unwrap();
+        // let vm_state = self.vm.save_state().unwrap();
+
+        println!("cpu rip before saving: {}", vm_state.vcpus_state[0].regs.rip);
+        // println!("vcpus len before saving: {:?}",self.vm.vcpus.len());
+        println!("vcpustate len before saving : {:?}", vm_state.vcpus_state.len());
+
+        // let bytes = unsafe { std::mem::transmute::<VmState, [u8; std::mem::size_of::<VmState>()]>(vm_state) };
+        // snapshot_file.write_all(&bytes).unwrap();
+        // let state_size = mem::size_of::<VmState>();
+
+        let mut mem = Vec::new();
+        let mut version_map = VersionMap::new();
+        // version_map
+        //     .new_version() 
+        //     .set_type_version(VmState::type_id(), 1) 
+        //     .new_version() 
+        //     .set_type_version(VmState::type_id(), 1); 
+
+
+        vm_state
+            .serialize(&mut mem, &version_map, 1)
+            .unwrap();
+
+        // println!("mem len: {} mem: {:?}\n\n\n\n", mem.len(), mem);
+
+        // serde_json::to_writer(&mut snapshot_file, &mem).unwrap();
+        snapshot_file.write_all(&mem).unwrap(); 
+
+        // println!("state saved");
+
+        // let mut snapshot_file = File::open(snapshot_path).unwrap();
+        // let mut bytes = Vec::new();
+        // snapshot_file.read(&mut bytes).unwrap();
+        // snapshot_file.read_to_end(&mut bytes).unwrap();
+        // // println!("bytes len: {} bytes: {:?}", bytes.len(), bytes);
+        // let vm_state = VmState::deserialize(&mut bytes.as_slice(), &version_map, 1).unwrap();
+        // println!("vcpustate len after saving : {:?}", vm_state.vcpus_state.len());
+
+
+    }
+    
+    /// restore cpu
+    pub fn restore_cpu(snapshot_path: &str) -> VmState{
+
+        let mut snapshot_file = File::open(snapshot_path).unwrap();
+        let mut version_map = VersionMap::new();
+        let mut bytes = Vec::new();
+
+        snapshot_file.read_to_end(&mut bytes).unwrap();
+        let mut vm_state = VmState::deserialize(&mut bytes.as_slice(), &version_map, 1).unwrap();
+        println!("cpu rip after read: {}", vm_state.vcpus_state[0].regs.rip);
+        use kvm_bindings::kvm_regs;
+        let regs = kvm_regs { rax: 18446744071583216976, rbx: 18446612682324879616, rcx: 0, rdx: 1018, rsi: 2, rdi: 18446744071599936736, rsp: 18446683600570039976, rbp: 18446683600570040000, r8: 176, r9: 0, r10: 0, r11: 0, r12: 18446744071599936736, r13: 0, r14: 18446744071599937240, r15: 0, rip: 18446744071583216990, rflags: 6 };
+
+        vm_state
+    }
+
     /// Run the VMM.
     pub fn run(&mut self) -> Result<()> {
         let load_result = self.load_kernel()?;
         #[cfg(target_arch = "x86_64")]
         let kernel_load_addr = self.compute_kernel_load_addr(&load_result)?;
+        // let kernel_load_addr = GuestAddress(1049088);
         #[cfg(target_arch = "aarch64")]
         let kernel_load_addr = load_result.kernel_load;
 
@@ -339,30 +436,49 @@ impl Vmm {
     }
 
     // Create guest memory regions.
-    fn create_guest_memory(memory_config: &MemoryConfig) -> Result<GuestMemoryMmap> {
+    fn create_guest_memory(path: &str, memory_config: &MemoryConfig) -> Result<GuestMemoryMmap> {
         let mem_size = ((memory_config.size_mib as u64) << 20) as usize;
-        let mem_regions = Vmm::create_memory_regions(mem_size);
+        let mem_regions = Vmm::create_memory_regions(path, mem_size);
 
         // Create guest memory from regions.
-        GuestMemoryMmap::from_ranges(&mem_regions)
-            .map_err(|e| Error::Memory(MemoryError::VmMemory(e)))
+        // GuestMemoryMmap::from_ranges(&mem_regions)
+        //     .map_err(|e| Error::Memory(MemoryError::VmMemory(e)))
+        GuestMemoryMmap::from_ranges_with_files(
+            mem_regions
+        )
+        .map_err(|e| Error::Memory(MemoryError::VmMemory(e)))
     }
 
-    fn create_memory_regions(mem_size: usize) -> Vec<(GuestAddress, usize)> {
+    fn create_memory_regions(path: &str, mem_size: usize) -> Vec<(GuestAddress, usize, Option<FileOffset>)> {
         #[cfg(target_arch = "x86_64")]
         // On x86_64, they surround the MMIO gap (dedicated space for MMIO device slots) if the
         // configured memory size exceeds the latter's starting address.
+
+        
         match mem_size.checked_sub(MMIO_GAP_START as usize) {
             // Guest memory fits before the MMIO gap.
-            None | Some(0) => vec![(GuestAddress(0), mem_size)],
+            None | Some(0) =>
+                vec![(GuestAddress(0), mem_size, Some(Self::get_file_offset(path).unwrap()))],
             // Guest memory extends beyond the MMIO gap.
-            Some(remaining) => vec![
-                (GuestAddress(0), MMIO_GAP_START as usize),
-                (GuestAddress(MMIO_GAP_END), remaining),
+            Some(remaining) => 
+            vec![
+                (GuestAddress(0), MMIO_GAP_START as usize, Some(Self::get_file_offset(path).unwrap())),
+                // FIXME: path wrong
+                (GuestAddress(MMIO_GAP_END), remaining, Some(Self::get_file_offset(path).unwrap())),
             ],
         }
+
         #[cfg(target_arch = "aarch64")]
         vec![(GuestAddress(AARCH64_PHYS_MEM_START), mem_size)]
+    }
+
+    fn get_file_offset(name: &str) ->  Result<FileOffset> {
+        let f = File::options()
+        .read(true)
+        .write(true)
+        .open(name)
+        .unwrap();
+        Ok(FileOffset::new(f,0))
     }
 
     // Load the kernel into guest memory.

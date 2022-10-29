@@ -6,6 +6,9 @@ use std::io::{self, ErrorKind};
 use std::sync::{Arc, Barrier, Mutex};
 use std::thread::{self, JoinHandle};
 
+use versionize::{VersionMap, Versionize, VersionizeResult};
+use versionize_derive::Versionize;
+
 use kvm_bindings::kvm_userspace_memory_region;
 #[cfg(target_arch = "x86_64")]
 use kvm_bindings::{
@@ -28,7 +31,7 @@ use vm_vcpu_ref::aarch64::interrupts::{self, Gic, GicConfig};
 use vm_vcpu_ref::x86_64::mptable::{self, MpTable};
 
 /// Defines the configuration of this VM.
-#[derive(Clone)]
+#[derive(Clone,Versionize)]
 pub struct VmConfig {
     pub num_vcpus: u8,
     pub vcpus_config: VcpuConfigList,
@@ -45,7 +48,7 @@ impl VmConfig {
 }
 
 #[cfg(target_arch = "x86_64")]
-#[derive(Clone)]
+#[derive(Clone, Versionize)]
 pub struct VmState {
     pub pitstate: kvm_pit_state2,
     pub clock: kvm_clock_data,
@@ -73,7 +76,7 @@ pub struct KvmVm<EH: ExitHandler + Send> {
     // Only one of `vcpus` or `vcpu_handles` can be active at a time.
     // To create the `vcpu_handles` the `vcpu` vector is drained.
     // A better abstraction should be used to represent this behavior.
-    vcpus: Vec<KvmVcpu>,
+    pub vcpus: Vec<KvmVcpu>,
     vcpu_handles: Vec<JoinHandle<()>>,
     exit_handler: EH,
     vcpu_barrier: Arc<Barrier>,
