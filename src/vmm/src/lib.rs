@@ -250,7 +250,8 @@ pub struct Vmm {
     // TODO-continued: after the other resources are created.
     #[cfg(target_arch = "aarch64")]
     pub num_vcpus: u64,
-    pub is_resume: bool
+    pub is_resume: bool,
+    // pub kvm: Kvm
     
 }
 
@@ -439,18 +440,22 @@ impl TryFrom<VMMConfig> for Vmm {
         let mut vmm = Vmm {
             vm: my_vm,
             guest_memory,
-            device_mgr,
+            device_mgr: device_mgr.clone(),
             event_mgr: event_manager,
             kernel_cfg: config.kernel_config,
-            exit_handler: wrapped_exit_handler,
+            exit_handler: wrapped_exit_handler.clone(),
             block_devices: Vec::new(),
             net_devices: Vec::new(),
             rpc_controller,
             #[cfg(target_arch = "aarch64")]
             num_vcpus: config.vcpu_config.num as u64,
-            is_resume: is_resume
+            is_resume: is_resume,
+            // kvm: kvm
         };
 
+        println!("vcpu state: {:?}", vmm.vm.vcpus[0].run_state.vm_state.lock().unwrap());
+
+        // INFERENCE: snapshot restored after add_serial_console won't work
         vmm.add_serial_console()?;
         #[cfg(target_arch = "x86_64")]
         vmm.add_i8042_device()?;
@@ -466,8 +471,10 @@ impl TryFrom<VMMConfig> for Vmm {
             vmm.add_net_device(cfg)?;
         }
 
+
         Ok(vmm)
     }
+    
 }
 
 impl Vmm {
@@ -507,8 +514,22 @@ impl Vmm {
         // Self::save_snapshot_helper(&snapshot_path[..], &memory_snapshot_path[..]).unwrap();
         // FIXME: issue here is to get mutable reference to self.
         println!("Setting and notifying");
+
+        // println!("saving cpu");
+        // Self::save_cpu("temp_cpu.txt", &vm_state);
+        // println!("restoring cpu");
+        // let vm_state = Self::restore_cpu("temp_cpu.txt");
+        // self.vm = KvmVm::from_state(
+        //     &Kvm::new().map_err(Error::KvmIoctl).unwrap(),
+        //     vm_state,
+        //     &self.guest_memory,
+        //     self.exit_handler.clone(),
+        //     self.device_mgr.clone()
+        // ).unwrap();
+
         // NOTE: 4. Set and notify all vcpus to Running state so that they breaks out of their wait loop and resumes
         self.vm.vcpu_run_state.set_and_notify(VmRunState::Running);        
+        // self.vm.run(Some(GuestAddress(0)), true).unwrap();
 
     }
 
@@ -615,8 +636,8 @@ impl Vmm {
         snapshot_file.read_to_end(&mut bytes).unwrap();
         let mut vm_state = VmState::deserialize(&mut bytes.as_slice(), &version_map, 1).unwrap();
         println!("cpu rip after read: {}", vm_state.vcpus_state[0].regs.rip);
-        use kvm_bindings::kvm_regs;
-        let regs = kvm_regs { rax: 18446744071583216976, rbx: 18446612682324879616, rcx: 0, rdx: 1018, rsi: 2, rdi: 18446744071599936736, rsp: 18446683600570039976, rbp: 18446683600570040000, r8: 176, r9: 0, r10: 0, r11: 0, r12: 18446744071599936736, r13: 0, r14: 18446744071599937240, r15: 0, rip: 18446744071583216990, rflags: 6 };
+        // use kvm_bindings::kvm_regs;
+        // let regs = kvm_regs { rax: 18446744071583216976, rbx: 18446612682324879616, rcx: 0, rdx: 1018, rsi: 2, rdi: 18446744071599936736, rsp: 18446683600570039976, rbp: 18446683600570040000, r8: 176, r9: 0, r10: 0, r11: 0, r12: 18446744071599936736, r13: 0, r14: 18446744071599937240, r15: 0, rip: 18446744071583216990, rflags: 6 };
 
         vm_state
     }
@@ -669,6 +690,20 @@ impl Vmm {
         // self.guest_memory= guest_memory ;
         // // self.vm = KvmVm::from_state(self, vmstate, &guest_memory,self.exit_handler, self.device_mgr).unwrap();
         // println!("restored snapshot before vm.run");
+
+        // println!("saving cpu");
+        // let vm_state = self.vm.save_state_tmp().unwrap();
+        // Self::save_cpu("temp_cpu.txt", &vm_state);
+        // println!("restoring cpu");
+        // let vm_state = Self::restore_cpu("temp_cpu.txt");
+        // self.vm = KvmVm::from_state(
+        //     &self.kvm,
+        //     vm_state,
+        //     &self.guest_memory,
+        //     self.exit_handler.clone(),
+        //     self.device_mgr.clone()
+        // ).unwrap();
+
         println!("FLOW: Starting VM");        
         self.vm.run(Some(kernel_load_addr), self.is_resume).map_err(Error::Vm)?;
         

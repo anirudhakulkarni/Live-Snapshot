@@ -322,7 +322,7 @@ pub struct KvmVcpu {
     device_mgr: Arc<Mutex<IoManager>>,
     config: VcpuConfig,
     run_barrier: Arc<Barrier>,
-    pub(crate) run_state: Arc<VcpuRunState>,
+    pub run_state: Arc<VcpuRunState>,
     tx: mpsc::Sender<i32>
 }
 
@@ -726,15 +726,18 @@ impl KvmVcpu {
         self.init_tls()?;
 
         self.run_barrier.wait();
+
+        // let mut counter = 0;
+
         println!("Going into cpu run");
         'vcpu_run: loop {
             let mut interrupted_by_signal = false;
             match self.vcpu_fd.run() {
                 Ok(exit_reason) => {
-                    println!("{:#?}", exit_reason);
+                    // println!("{:#?}", exit_reason);
                     match exit_reason {
                         VcpuExit::Shutdown | VcpuExit::Hlt => {
-                            println!("Guest shutdown: {:?}. Bye!", exit_reason);
+                            // println!("Guest shutdown: {:?}. Bye!", exit_reason);
                             if stdin().lock().set_canon_mode().is_err() {
                                 eprintln!("Failed to set canon mode. Stdin will not echo.");
                             }
@@ -742,6 +745,14 @@ impl KvmVcpu {
                             break;
                         }
                         VcpuExit::IoOut(addr, data) => {
+                            
+                            // counter += 1;
+                            // if(counter%1000 == 0){println!("\n======counter={}========",counter);}
+                            // if(counter == 15000){
+                            //     println!("saving vcpu");
+                            //     self.write_state();
+                            // }
+
                             if (0x3f8..(0x3f8 + 8)).contains(&addr) {
                                 // Write at the serial port.
                                 if self
@@ -864,14 +875,22 @@ impl KvmVcpu {
                             // The VM is suspending. We run this loop until we get a different
                             // state.
                             println!("Suspending the threads");
-                            self.write_state();
+                            // self.write_state();
                             self.tx.send(self.config.id.into()).unwrap();
+                            self.write_state();
+
+                            // INFERENCE::
+                            // If write_state is done before tx.send then stuck else shutdown
+                            // If with write_state above tx.send, we save state with resume = false then ^C doesn't work but
+                            // with resume = true it does
                         }
                         VmRunState::Exiting => {
                             // The VM is exiting. We also exit from this VCPU thread.
                             // self.write_state();
                             println!("Exiting the threads");
+                            // self.write_state();
                             self.tx.send(self.config.id.into()).unwrap();
+                            self.write_state();
                             break 'vcpu_run;
                         }
                     }
