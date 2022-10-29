@@ -133,6 +133,17 @@ impl TryFrom<&str> for VcpuConfig {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct SnapshotConfig {
+    pub cpu_snapshot_path: String,
+    pub memory_snapshot_path: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RpcConfig {
+    pub port: u16,
+}
+
 /// Guest kernel configurations.
 #[derive(Clone, Debug, PartialEq)]
 pub struct KernelConfig {
@@ -271,6 +282,10 @@ pub struct VMMConfig {
     pub net_config: Option<NetConfig>,
     /// Block device configuration.
     pub block_config: Option<BlockConfig>,
+    /// Snapshot configuration
+    pub snapshot_config: Option<SnapshotConfig>,
+    /// RPC configuration
+    pub rpc_config: Option<RpcConfig>
 }
 
 #[cfg(test)]

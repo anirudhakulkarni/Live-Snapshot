@@ -5,12 +5,13 @@
 use libc::siginfo_t;
 use std::cell::RefCell;
 use std::ffi::c_void;
-use std::io::{self, stdin};
+use std::io::{self, stdin, Write};
 use std::os::raw::c_int;
 use std::result;
-use std::sync::{Arc, Barrier, Condvar, Mutex};
+use std::sync::{Arc, Barrier, Condvar, Mutex, mpsc};
 use versionize::{VersionMap, Versionize, VersionizeResult};
 use versionize_derive::Versionize;
+use std::fs::OpenOptions;
 
 #[cfg(target_arch = "x86_64")]
 use kvm_bindings::{
@@ -299,7 +300,7 @@ pub struct VcpuState {
 /// Represents the current run state of the VCPUs.
 #[derive(Default)]
 pub struct VcpuRunState {
-    pub(crate) vm_state: Mutex<VmRunState>,
+    pub vm_state: Mutex<VmRunState>,
     condvar: Condvar,
 }
 
@@ -322,11 +323,41 @@ pub struct KvmVcpu {
     config: VcpuConfig,
     run_barrier: Arc<Barrier>,
     pub(crate) run_state: Arc<VcpuRunState>,
+    tx: mpsc::Sender<i32>
 }
+
 
 impl KvmVcpu {
     thread_local!(static TLS_VCPU_PTR: RefCell<Option<*const KvmVcpu>> = RefCell::new(None));
+    pub fn write_state(&self) {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .open("suspend.txt")
+            .unwrap();
+        // write vcpu state to file
+        let mut mem = Vec::new();
+        let vcpu_state = self.save_state().unwrap();
 
+        let mut version_map = VersionMap::new();
+        vcpu_state
+            .serialize(&mut mem, &version_map, 1)
+            .unwrap();
+        // println!("cpu rip after suspend: {}",vcpu_state.regs.rip);
+        // println!("regs: \n{:?}", self.vcpu_fd.get_regs().unwrap());
+    
+        // println!("============[STATE]===============");
+        // let cpu_state = self.save_state().unwrap();
+    
+        // println!("lapic :{:?}", cpu_state.lapic);
+        // println!("mp_state :{:?}", cpu_state.mp_state);
+        // println!("regs :{:?}", cpu_state.regs);
+    
+    
+        file.write_all(&mem).unwrap();
+    }
+    
+    
     /// Create a new vCPU.
     pub fn new<M: GuestMemory>(
         vm_fd: &VmFd,
@@ -335,6 +366,7 @@ impl KvmVcpu {
         run_barrier: Arc<Barrier>,
         run_state: Arc<VcpuRunState>,
         memory: &M,
+        tx: mpsc::Sender<i32>
     ) -> Result<Self> {
         #[cfg(target_arch = "x86_64")]
         let vcpu;
@@ -349,6 +381,7 @@ impl KvmVcpu {
             config,
             run_barrier,
             run_state,
+            tx
         };
 
         #[cfg(target_arch = "x86_64")]
@@ -429,6 +462,7 @@ impl KvmVcpu {
         state: VcpuState,
         run_barrier: Arc<Barrier>,
         run_state: Arc<VcpuRunState>,
+        tx: mpsc::Sender<i32>
     ) -> Result<Self> {
         let mut vcpu = KvmVcpu {
             vcpu_fd: vm_fd
@@ -438,6 +472,7 @@ impl KvmVcpu {
             config: state.config.clone(),
             run_barrier,
             run_state,
+            tx
         };
 
         #[cfg(target_arch = "aarch64")]
@@ -672,17 +707,20 @@ impl KvmVcpu {
     /// * `instruction_pointer`: Represents the start address of the vcpu. This can be None
     /// when the IP is specified using the platform dependent registers.
     #[allow(clippy::if_same_then_else)]
-    pub fn run(&mut self, instruction_pointer: Option<GuestAddress>) -> Result<()> {
-        if let Some(ip) = instruction_pointer {
-            #[cfg(target_arch = "x86_64")]
-            self.configure_regs(ip)?;
-            #[cfg(target_arch = "aarch64")]
-            if self.config.id == 0 {
-                let data = ip.0;
-                let reg_id = arm64_core_reg!(pc);
-                self.vcpu_fd
-                    .set_one_reg(reg_id, data)
-                    .map_err(Error::VcpuSetReg)?;
+    pub fn run(&mut self, instruction_pointer: Option<GuestAddress>, is_resume: bool) -> Result<()> {
+
+        if !is_resume {
+            if let Some(ip) = instruction_pointer {
+                #[cfg(target_arch = "x86_64")]
+                self.configure_regs(ip)?;
+                #[cfg(target_arch = "aarch64")]
+                if self.config.id == 0 {
+                    let data = ip.0;
+                    let reg_id = arm64_core_reg!(pc);
+                    self.vcpu_fd
+                        .set_one_reg(reg_id, data)
+                        .map_err(Error::VcpuSetReg)?;
+                }
             }
         }
         self.init_tls()?;
@@ -824,9 +862,15 @@ impl KvmVcpu {
                         VmRunState::Suspending => {
                             // The VM is suspending. We run this loop until we get a different
                             // state.
+                            println!("Suspending the threads");
+                            self.write_state();
+                            self.tx.send(self.config.id.into()).unwrap();
                         }
                         VmRunState::Exiting => {
                             // The VM is exiting. We also exit from this VCPU thread.
+                            // self.write_state();
+                            println!("Exiting the threads");
+                            self.tx.send(self.config.id.into()).unwrap();
                             break 'vcpu_run;
                         }
                     }
@@ -847,7 +891,7 @@ impl KvmVcpu {
     }
 
     #[cfg(target_arch = "x86_64")]
-    pub fn save_state(&mut self) -> Result<VcpuState> {
+    pub fn save_state(&self) -> Result<VcpuState> {
         let mp_state = self.vcpu_fd.get_mp_state().map_err(Error::VcpuGetMpState)?;
         let regs = self.vcpu_fd.get_regs().map_err(Error::VcpuGetRegs)?;
         let sregs = self.vcpu_fd.get_sregs().map_err(Error::VcpuGetSregs)?;

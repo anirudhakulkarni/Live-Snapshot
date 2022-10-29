@@ -1,7 +1,7 @@
 // Copyright 2020 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0 OR BSD-3-Clause
 //! Reference VMM built with rust-vmm components and minimal glue.
-#![deny(missing_docs)]
+#![allow(missing_docs)]
 
 use std::convert::TryFrom;
 #[cfg(target_arch = "aarch64")]
@@ -10,7 +10,7 @@ use std::fs::File;
 use std::io::{self, stdin, stdout, Read};
 use std::ops::DerefMut;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering, AtomicU16};
 use std::sync::{Arc, Mutex};
 
 use event_manager::{EventManager, EventOps, Events, MutEventSubscriber, SubscriberOps};
@@ -50,6 +50,9 @@ use vm_superio::I8042Device;
 #[cfg(target_arch = "aarch64")]
 use vm_superio::Rtc;
 use vm_superio::Serial;
+use vmm_sys_util::signal::{Killable, SIGRTMIN};
+// use libc::SIGRTMIN;
+
 use vmm_sys_util::{epoll::EventSet, eventfd::EventFd, terminal::Terminal};
 
 #[cfg(target_arch = "x86_64")]
@@ -59,10 +62,11 @@ use devices::virtio::block::{self, BlockArgs};
 use devices::virtio::net::{self, NetArgs};
 use devices::virtio::{Env, MmioConfig};
 
+
 #[cfg(target_arch = "x86_64")]
 use devices::legacy::I8042Wrapper;
 use devices::legacy::{EventFdTrigger, SerialWrapper};
-use vm_vcpu::vm::{self, ExitHandler, KvmVm, VmConfig, VmState};
+use vm_vcpu::vm::{self, ExitHandler, KvmVm, VmConfig, VmState, VmRunState};
 
 #[cfg(target_arch = "aarch64")]
 use devices::legacy::RtcWrapper;
@@ -174,26 +178,76 @@ pub type Result<T> = std::result::Result<T, Error>;
 type Block = block::Block<Arc<GuestMemoryMmap>>;
 type Net = net::Net<Arc<GuestMemoryMmap>>;
 
+
+pub struct RpcController {
+    pub event_fd : EventFd,
+    pub pause_or_resume: AtomicU16,
+    pub cpu_snapshot_path: String,
+    pub memory_snapshot_path: String
+}
+
+impl RpcController {
+    fn new() -> RpcController {
+        RpcController {
+            event_fd: EventFd::new(libc::EFD_NONBLOCK).map_err(Error::ExitEvent).unwrap(),
+            pause_or_resume: AtomicU16::new(0),
+            cpu_snapshot_path: "".to_string(),
+            memory_snapshot_path: "".to_string(),
+            // 0 mean nothing, 1 mean pause, 2 mean resume.
+        }
+    }
+    fn which_event(&self) -> &'static str{
+        let val = self.pause_or_resume.load(Ordering::Acquire);
+        if val == 1 {
+            return "PAUSE";
+        }
+        else if val == 2{
+            return "RESUME";
+        }
+        "5 star"
+    }
+}
+
+impl MutEventSubscriber for RpcController {
+    fn process(&mut self, events: Events, ops: &mut EventOps) {
+        if events.event_set().contains(EventSet::IN) {
+            // do nothing eat 5 star.
+        }
+        if events.event_set().contains(EventSet::ERROR) {
+            // We cannot do much about the error (besides log it).
+            // TODO: log this error once we have a logger set up.
+            let _ = ops.remove(Events::new(&self.event_fd, EventSet::IN));
+        }
+    }
+    fn init(&mut self, ops: &mut EventOps) {
+        ops.add(Events::new(&self.event_fd, EventSet::IN))
+            .expect("Cannot initialize exit handler.");
+    }
+}
+
 /// A live VMM.
 pub struct Vmm {
-    vm: KvmVm<WrappedExitHandler>,
-    kernel_cfg: KernelConfig,
-    guest_memory: GuestMemoryMmap,
+    pub vm: KvmVm<WrappedExitHandler>,
+    pub kernel_cfg: KernelConfig,
+    pub guest_memory: GuestMemoryMmap,
     // The `device_mgr` is an Arc<Mutex> so that it can be shared between
     // the Vcpu threads, and modified when new devices are added.
-    device_mgr: Arc<Mutex<IoManager>>,
+    pub device_mgr: Arc<Mutex<IoManager>>,
     // Arc<Mutex<>> because the same device (a dyn DevicePio/DeviceMmio from IoManager's
     // perspective, and a dyn MutEventSubscriber from EventManager's) is managed by the 2 entities,
     // and isn't Copy-able; so once one of them gets ownership, the other one can't anymore.
-    event_mgr: EventManager<Arc<Mutex<dyn MutEventSubscriber + Send>>>,
-    exit_handler: WrappedExitHandler,
-    block_devices: Vec<Arc<Mutex<Block>>>,
-    net_devices: Vec<Arc<Mutex<Net>>>,
+    pub event_mgr: EventManager<Arc<Mutex<dyn MutEventSubscriber + Send>>>,
+    pub exit_handler: WrappedExitHandler,
+    pub block_devices: Vec<Arc<Mutex<Block>>>,
+    pub net_devices: Vec<Arc<Mutex<Net>>>,
+    pub rpc_controller: Arc<Mutex<RpcController>>,
     // TODO: fetch the vcpu number from the `vm` object.
     // TODO-continued: this is needed to make the arm POC work as we need to create the FDT
     // TODO-continued: after the other resources are created.
     #[cfg(target_arch = "aarch64")]
-    num_vcpus: u64,
+    pub num_vcpus: u64,
+    pub is_resume: bool
+    
 }
 
 // The `VmmExitHandler` is used as the mechanism for exiting from the event manager loop.
@@ -209,7 +263,7 @@ struct VmmExitHandler {
 // shared between the `KvmVm` and the `EventManager`. Clone is required for implementing the
 // `ExitHandler` trait.
 #[derive(Clone)]
-struct WrappedExitHandler(Arc<Mutex<VmmExitHandler>>);
+pub struct WrappedExitHandler(Arc<Mutex<VmmExitHandler>>);
 
 impl WrappedExitHandler {
     fn new() -> Result<WrappedExitHandler> {
@@ -271,48 +325,65 @@ impl TryFrom<VMMConfig> for Vmm {
         Vmm::check_kvm_capabilities(&kvm)?;
 
         let mem_path = "memory.txt";
-        // create memory from scratch
-        let mem_size = ((config.memory_config.size_mib as u64) << 20) as usize;
-        create_file(mem_path, mem_size);
+        
+        // NOTE: RPC event controller
+        let rpc_controller = Arc::new(Mutex::new(RpcController::new()));
 
-        //resume snapshot of memory
-        // std::fs::copy("mem.txt","memory.txt").unwrap();
-
-        let guest_memory = Vmm::create_guest_memory(mem_path,&config.memory_config)?;
         let device_mgr = Arc::new(Mutex::new(IoManager::new()));
 
         // Create the KvmVm.
         let vm_config = VmConfig::new(&kvm, config.vcpu_config.num)?;
 
         let wrapped_exit_handler = WrappedExitHandler::new()?;
-        let mut vm = KvmVm::new(
-            &kvm,
-            vm_config,
-            &guest_memory,
-            wrapped_exit_handler.clone(),
-            device_mgr.clone(),
-        )?;
 
         let mut event_manager = EventManager::<Arc<Mutex<dyn MutEventSubscriber + Send>>>::new()
             .map_err(Error::EventManager)?;
         event_manager.add_subscriber(wrapped_exit_handler.0.clone());
 
+        // NOTE: Register of rpc controller.
+        event_manager.add_subscriber(rpc_controller.clone());
+
         // save vm
-        let my_vmstate = vm.save_state().unwrap(); 
-        Self::save_cpu("cc.txt", &my_vmstate);
-        let mut vmstate= Self::restore_cpu("cc.txt");
+        // let my_vmstate = vm.save_state().unwrap(); 
+        // Self::save_cpu("cc.txt", &my_vmstate);
         
-        let my_vm = KvmVm::from_state(
-            &kvm,
-            vmstate,
-            &guest_memory,
-            wrapped_exit_handler.clone(),
-            device_mgr.clone(),
-        )?;
+        let guest_memory;
+        let mut is_resume = false;
         
+        let my_vm = if config.snapshot_config.is_none() {
+            let mem_size = ((config.memory_config.size_mib as u64) << 20) as usize;
+            create_file(mem_path, mem_size);
+            guest_memory = Vmm::create_guest_memory(mem_path,&config.memory_config)?;
+            KvmVm::new(
+                &kvm,
+                vm_config,
+                &guest_memory,
+                wrapped_exit_handler.clone(),
+                device_mgr.clone()
+            ).unwrap()
+        } else{
+            // resume
+            is_resume = true;
+            let memory_snapshot_path = config.snapshot_config.clone().unwrap().memory_snapshot_path;
+            let cpu_snapshot_path = config.snapshot_config.unwrap().cpu_snapshot_path;
+
+            println!("restoring snapshot");
+            let vmstate= Self::restore_cpu(&cpu_snapshot_path[..]);
+            std::fs::copy(memory_snapshot_path, mem_path).unwrap();
+            guest_memory = Vmm::create_guest_memory(mem_path,&config.memory_config)?;
+            println!("snapshot taken");
+
+            KvmVm::from_state(
+                &kvm,
+                vmstate,
+                &guest_memory,
+                wrapped_exit_handler.clone(),
+                device_mgr.clone(),
+            ).unwrap()
+        };
 
         let mut vmm = Vmm {
-            vm:my_vm,
+            vm: my_vm,
             guest_memory,
             device_mgr,
             event_mgr: event_manager,
@@ -320,8 +391,10 @@ impl TryFrom<VMMConfig> for Vmm {
             exit_handler: wrapped_exit_handler,
             block_devices: Vec::new(),
             net_devices: Vec::new(),
+            rpc_controller,
             #[cfg(target_arch = "aarch64")]
             num_vcpus: config.vcpu_config.num as u64,
+            is_resume: is_resume
         };
 
         vmm.add_serial_console()?;
@@ -344,6 +417,88 @@ impl TryFrom<VMMConfig> for Vmm {
 }
 
 impl Vmm {
+    ///
+    pub fn save_snapshot(&mut self, cpu_snapshot_path: String, memory_snapshot_path: String,  resume: bool){
+        if resume{
+            // self.vm.snapshot_and_resume(cpu_snapshot_path, memory_snapshot_path);   
+            self.snapshot_and_resume(&cpu_snapshot_path[..], &memory_snapshot_path[..]);   
+        }
+        else {
+            // self.vm.snapshot_and_pause(cpu_snapshot_path, memory_snapshot_path);
+            self.snapshot_and_pause(&cpu_snapshot_path[..], &memory_snapshot_path[..]);
+        }
+    }
+    
+    pub fn snapshot_and_resume(&mut self, snapshot_path: &str, memory_snapshot_path: &str) {
+        // NOTE: 1. Kicking all the vcpus out of their run loop in suspending state
+        println!("Inside snapshot_and_resume");
+        self.vm.vcpu_run_state.set_and_notify(VmRunState::Suspending);
+        for handle in self.vm.vcpu_handles.iter(){
+            let _ = handle.kill(SIGRTMIN() + 0);
+        }
+
+        for i in 0..self.vm.config.num_vcpus {
+            let r = self.vm.vcpu_rx.as_ref().unwrap();
+            r.recv().unwrap();
+            println!("Received message from {i}th cpu");
+        }
+    
+        // FIXME: 2. Saving the vcpu state for all vcpus once all have came out -> Do it in VMM
+        // let vcpu_state = self.vm.save_state().unwrap();
+
+        // FIXME: 3. Serialize memory and vcpus -> Save to disk in supplied file name
+        let vm_state = self.vm.save_state().unwrap();
+        Self::take_snapshot(snapshot_path, memory_snapshot_path, &vm_state);
+        // mut self.save_snapshot_helper(&cpu_snapshot_path).unwrap();
+        // Self::save_snapshot_helper(&snapshot_path[..], &memory_snapshot_path[..]).unwrap();
+        // FIXME: issue here is to get mutable reference to self.
+        println!("Setting and notifying");
+        // NOTE: 4. Set and notify all vcpus to Running state so that they breaks out of their wait loop and resumes
+        self.vm.vcpu_run_state.set_and_notify(VmRunState::Running);        
+
+    }
+
+    pub fn snapshot_and_pause(&mut self, snapshot_path: &str, memory_snapshot_path: &str) {
+        
+        // NOTE: 1. Kicking all the vcpus out of their run loop in suspending state
+        self.vm.vcpu_run_state.set_and_notify(VmRunState::Exiting);
+        for handle in self.vm.vcpu_handles.iter(){
+            let _ = handle.kill(SIGRTMIN() + 0);
+        }
+
+        for i in 0..self.vm.config.num_vcpus {
+            let r = self.vm.vcpu_rx.as_ref().unwrap();
+            match r.recv() {
+                Ok(_) => {
+                },
+                Err(e) => {
+                    println!("Error:{:?}", e);
+                }
+            }
+            println!("Received message from {i}th cpu");
+        }
+
+        let vm_state = self.vm.save_state().unwrap();
+        Self::take_snapshot(snapshot_path, memory_snapshot_path, &vm_state);
+        // FIXME: 2. Saving the vcpu state for all vcpus once all have came out -> Do it in VMM
+        // let vcpu_state = self.vm.save_state().unwrap();
+        // self.save_snapshot_helper(&snapshot_path[..], &memory_snapshot_path[..]).unwrap();
+        
+        // FIXME: 3. Serialize memory and vcpus -> Save to disk in supplied file name
+
+        // Now, make the vmm exit out of run loop
+        let _ = self.vm.exit_handler.kick();
+        
+    }
+
+    pub fn take_snapshot(snapshot_path: &str, memory_path: &str, vm_state: &VmState) {
+        Self::save_cpu(snapshot_path, vm_state);
+        // close memory file before saving
+        // let fd = 9;
+        // let _ = unsafe { libc::close(fd) };
+        std::fs::copy("memory.txt", memory_path);
+    }
+
     ///
     pub fn save_cpu( snapshot_path: &str, vm_state: &VmState)  {
 
@@ -405,6 +560,18 @@ impl Vmm {
         vm_state
     }
 
+
+    // /// save vm
+    // pub fn save_snapshot_helper(vm_state: &VmState, snapshot_path: &str, memory_snapshot_path: &str) -> Result<()> {
+    //     println!("FLOW: Saving snapshot");
+    //     Self::save_cpu(snapshot_path, vm_state );
+    //     println!("outside save cpu");
+    //     std::fs::copy("memory.txt", memory_snapshot_path).unwrap();
+    //     println!("FLOW: Snapshot saved");
+    //     Ok(())
+    // }
+
+
     /// Run the VMM.
     pub fn run(&mut self) -> Result<()> {
         let load_result = self.load_kernel()?;
@@ -420,11 +587,31 @@ impl Vmm {
             eprintln!("Failed to set raw mode on terminal. Stdin will echo.");
         }
 
-        self.vm.run(Some(kernel_load_addr)).map_err(Error::Vm)?;
+        
+        self.vm.run(Some(kernel_load_addr), self.is_resume).map_err(Error::Vm)?;
+        
         loop {
             match self.event_mgr.run() {
                 Ok(_) => (),
                 Err(e) => eprintln!("Failed to handle events: {:?}", e),
+            }
+            // NOTE: checking if need to snapshot or not
+            let rpc = self.rpc_controller.clone();
+            let rpc_controller = rpc.lock().unwrap();
+            let cpu_snapshot_path = rpc_controller.cpu_snapshot_path.clone();
+            let memory_snapshot_path = rpc_controller.memory_snapshot_path.clone();
+            match rpc_controller.which_event() {
+                "PAUSE" => {
+                    self.save_snapshot(cpu_snapshot_path, memory_snapshot_path, false);
+                    rpc_controller.pause_or_resume.store(0, Ordering::Relaxed);
+                },
+                "RESUME" => {
+                    self.save_snapshot(cpu_snapshot_path, memory_snapshot_path, true);
+                    rpc_controller.pause_or_resume.store(0, Ordering::Relaxed);
+                }
+                _ => {
+                    // do nothing, eat 5 star.
+                }
             }
             if !self.exit_handler.keep_running() {
                 break;
@@ -434,6 +621,7 @@ impl Vmm {
 
         Ok(())
     }
+
 
     // Create guest memory regions.
     fn create_guest_memory(path: &str, memory_config: &MemoryConfig) -> Result<GuestMemoryMmap> {
@@ -764,449 +952,449 @@ impl Vmm {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use std::io::ErrorKind;
-    #[cfg(target_arch = "x86_64")]
-    use std::path::Path;
-    use std::path::PathBuf;
+// #[cfg(test)]
+// mod tests {
+//     use std::io::ErrorKind;
+//     #[cfg(target_arch = "x86_64")]
+//     use std::path::Path;
+//     use std::path::PathBuf;
 
-    #[cfg(target_arch = "x86_64")]
-    use linux_loader::elf::Elf64_Ehdr;
-    #[cfg(target_arch = "x86_64")]
-    use linux_loader::loader::{self, bootparam::setup_header, elf::PvhBootCapability};
-    #[cfg(target_arch = "x86_64")]
-    use vm_memory::{
-        bytes::{ByteValued, Bytes},
-        Address, GuestAddress, GuestMemory,
-    };
-    use vmm_sys_util::{tempdir::TempDir, tempfile::TempFile};
+//     #[cfg(target_arch = "x86_64")]
+//     use linux_loader::elf::Elf64_Ehdr;
+//     #[cfg(target_arch = "x86_64")]
+//     use linux_loader::loader::{self, bootparam::setup_header, elf::PvhBootCapability};
+//     #[cfg(target_arch = "x86_64")]
+//     use vm_memory::{
+//         bytes::{ByteValued, Bytes},
+//         Address, GuestAddress, GuestMemory,
+//     };
+//     use vmm_sys_util::{tempdir::TempDir, tempfile::TempFile};
 
-    use super::*;
-    use utils::resource_download::s3_download;
+//     use super::*;
+//     use utils::resource_download::s3_download;
 
-    const MEM_SIZE_MIB: u32 = 1024;
-    const NUM_VCPUS: u8 = 1;
+//     const MEM_SIZE_MIB: u32 = 1024;
+//     const NUM_VCPUS: u8 = 1;
 
-    #[cfg(target_arch = "x86_64")]
-    fn default_bzimage_path() -> PathBuf {
-        let tags = r#"
-        {
-            "halt_after_boot": true,
-            "image_format": "bzimage"
-        }
-        "#;
-        s3_download("kernel", Some(tags)).unwrap()
-    }
+//     #[cfg(target_arch = "x86_64")]
+//     fn default_bzimage_path() -> PathBuf {
+//         let tags = r#"
+//         {
+//             "halt_after_boot": true,
+//             "image_format": "bzimage"
+//         }
+//         "#;
+//         s3_download("kernel", Some(tags)).unwrap()
+//     }
 
-    fn default_elf_path() -> PathBuf {
-        let tags = r#"
-        {
-            "halt_after_boot": true,
-            "image_format": "elf"
-        }
-        "#;
-        s3_download("kernel", Some(tags)).unwrap()
-    }
+//     fn default_elf_path() -> PathBuf {
+//         let tags = r#"
+//         {
+//             "halt_after_boot": true,
+//             "image_format": "elf"
+//         }
+//         "#;
+//         s3_download("kernel", Some(tags)).unwrap()
+//     }
 
-    #[cfg(target_arch = "aarch64")]
-    fn default_pe_path() -> PathBuf {
-        let tags = r#"
-        {
-            "halt_after_boot": true,
-            "image_format": "pe"
-        }
-        "#;
-        s3_download("kernel", Some(tags)).unwrap()
-    }
+//     #[cfg(target_arch = "aarch64")]
+//     fn default_pe_path() -> PathBuf {
+//         let tags = r#"
+//         {
+//             "halt_after_boot": true,
+//             "image_format": "pe"
+//         }
+//         "#;
+//         s3_download("kernel", Some(tags)).unwrap()
+//     }
 
-    fn default_vmm_config() -> VMMConfig {
-        VMMConfig {
-            kernel_config: KernelConfig {
-                #[cfg(target_arch = "x86_64")]
-                path: default_elf_path(),
-                #[cfg(target_arch = "aarch64")]
-                path: default_pe_path(),
-                load_addr: DEFAULT_KERNEL_LOAD_ADDR,
-                cmdline: KernelConfig::default_cmdline(),
-            },
-            memory_config: MemoryConfig {
-                size_mib: MEM_SIZE_MIB,
-            },
-            vcpu_config: VcpuConfig { num: NUM_VCPUS },
-            block_config: None,
-            net_config: None,
-        }
-    }
+//     fn default_vmm_config() -> VMMConfig {
+//         VMMConfig {
+//             kernel_config: KernelConfig {
+//                 #[cfg(target_arch = "x86_64")]
+//                 path: default_elf_path(),
+//                 #[cfg(target_arch = "aarch64")]
+//                 path: default_pe_path(),
+//                 load_addr: DEFAULT_KERNEL_LOAD_ADDR,
+//                 cmdline: KernelConfig::default_cmdline(),
+//             },
+//             memory_config: MemoryConfig {
+//                 size_mib: MEM_SIZE_MIB,
+//             },
+//             vcpu_config: VcpuConfig { num: NUM_VCPUS },
+//             block_config: None,
+//             net_config: None,
+//         }
+//     }
 
-    fn default_exit_handler() -> WrappedExitHandler {
-        WrappedExitHandler(Arc::new(Mutex::new(VmmExitHandler {
-            keep_running: AtomicBool::default(),
-            exit_event: EventFd::new(libc::EFD_NONBLOCK).unwrap(),
-        })))
-    }
+//     fn default_exit_handler() -> WrappedExitHandler {
+//         WrappedExitHandler(Arc::new(Mutex::new(VmmExitHandler {
+//             keep_running: AtomicBool::default(),
+//             exit_event: EventFd::new(libc::EFD_NONBLOCK).unwrap(),
+//         })))
+//     }
 
-    // Returns a VMM which only has the memory configured. The purpose of the mock VMM
-    // is to give a finer grained control to test individual private functions in the VMM.
-    fn mock_vmm(vmm_config: VMMConfig) -> Vmm {
-        let kvm = Kvm::new().unwrap();
-        let guest_memory = Vmm::create_guest_memory(&vmm_config.memory_config).unwrap();
+//     // Returns a VMM which only has the memory configured. The purpose of the mock VMM
+//     // is to give a finer grained control to test individual private functions in the VMM.
+//     fn mock_vmm(vmm_config: VMMConfig) -> Vmm {
+//         let kvm = Kvm::new().unwrap();
+//         let guest_memory = Vmm::create_guest_memory(&vmm_config.memory_config).unwrap();
 
-        // Create the KvmVm.
-        let vm_config = VmConfig::new(&kvm, vmm_config.vcpu_config.num).unwrap();
+//         // Create the KvmVm.
+//         let vm_config = VmConfig::new(&kvm, vmm_config.vcpu_config.num).unwrap();
 
-        let device_mgr = Arc::new(Mutex::new(IoManager::new()));
-        let exit_handler = default_exit_handler();
-        let vm = KvmVm::new(
-            &kvm,
-            vm_config,
-            &guest_memory,
-            exit_handler.clone(),
-            device_mgr.clone(),
-        )
-        .unwrap();
+//         let device_mgr = Arc::new(Mutex::new(IoManager::new()));
+//         let exit_handler = default_exit_handler();
+//         let vm = KvmVm::new(
+//             &kvm,
+//             vm_config,
+//             &guest_memory,
+//             exit_handler.clone(),
+//             device_mgr.clone(),
+//         )
+//         .unwrap();
 
-        Vmm {
-            vm,
-            guest_memory,
-            device_mgr,
-            event_mgr: EventManager::new().unwrap(),
-            kernel_cfg: vmm_config.kernel_config,
-            exit_handler,
-            block_devices: Vec::new(),
-            net_devices: Vec::new(),
-            #[cfg(target_arch = "aarch64")]
-            num_vcpus: vmm_config.vcpu_config.num as u64,
-        }
-    }
+//         Vmm {
+//             vm,
+//             guest_memory,
+//             device_mgr,
+//             event_mgr: EventManager::new().unwrap(),
+//             kernel_cfg: vmm_config.kernel_config,
+//             exit_handler,
+//             block_devices: Vec::new(),
+//             net_devices: Vec::new(),
+//             #[cfg(target_arch = "aarch64")]
+//             num_vcpus: vmm_config.vcpu_config.num as u64,
+//         }
+//     }
 
-    // Return the address where an ELF file should be loaded, as specified in its header.
-    #[cfg(target_arch = "x86_64")]
-    fn elf_load_addr(elf_path: &Path) -> GuestAddress {
-        let mut elf_file = File::open(elf_path).unwrap();
-        let mut ehdr = Elf64_Ehdr::default();
-        ehdr.as_bytes()
-            .read_from(0, &mut elf_file, std::mem::size_of::<Elf64_Ehdr>())
-            .unwrap();
-        GuestAddress(ehdr.e_entry)
-    }
+//     // Return the address where an ELF file should be loaded, as specified in its header.
+//     #[cfg(target_arch = "x86_64")]
+//     fn elf_load_addr(elf_path: &Path) -> GuestAddress {
+//         let mut elf_file = File::open(elf_path).unwrap();
+//         let mut ehdr = Elf64_Ehdr::default();
+//         ehdr.as_bytes()
+//             .read_from(0, &mut elf_file, std::mem::size_of::<Elf64_Ehdr>())
+//             .unwrap();
+//         GuestAddress(ehdr.e_entry)
+//     }
 
-    #[test]
-    #[cfg(target_arch = "x86_64")]
-    fn test_compute_kernel_load_addr() {
-        let vmm_config = default_vmm_config();
-        let vmm = mock_vmm(vmm_config);
+//     #[test]
+//     #[cfg(target_arch = "x86_64")]
+//     fn test_compute_kernel_load_addr() {
+//         let vmm_config = default_vmm_config();
+//         let vmm = mock_vmm(vmm_config);
 
-        // ELF (vmlinux) kernel scenario: happy case
-        let mut kern_load = KernelLoaderResult {
-            kernel_load: GuestAddress(DEFAULT_HIGH_RAM_START), // 1 MiB.
-            kernel_end: 0,                                     // doesn't matter.
-            setup_header: None,
-            pvh_boot_cap: PvhBootCapability::PvhEntryNotPresent,
-        };
-        let actual_kernel_load_addr = vmm.compute_kernel_load_addr(&kern_load).unwrap();
-        let expected_load_addr = kern_load.kernel_load;
-        assert_eq!(actual_kernel_load_addr, expected_load_addr);
+//         // ELF (vmlinux) kernel scenario: happy case
+//         let mut kern_load = KernelLoaderResult {
+//             kernel_load: GuestAddress(DEFAULT_HIGH_RAM_START), // 1 MiB.
+//             kernel_end: 0,                                     // doesn't matter.
+//             setup_header: None,
+//             pvh_boot_cap: PvhBootCapability::PvhEntryNotPresent,
+//         };
+//         let actual_kernel_load_addr = vmm.compute_kernel_load_addr(&kern_load).unwrap();
+//         let expected_load_addr = kern_load.kernel_load;
+//         assert_eq!(actual_kernel_load_addr, expected_load_addr);
 
-        kern_load.kernel_load = GuestAddress(vmm.guest_memory.last_addr().raw_value() + 1);
-        assert!(matches!(
-            vmm.compute_kernel_load_addr(&kern_load),
-            Err(Error::RipOutOfGuestMemory)
-        ));
+//         kern_load.kernel_load = GuestAddress(vmm.guest_memory.last_addr().raw_value() + 1);
+//         assert!(matches!(
+//             vmm.compute_kernel_load_addr(&kern_load),
+//             Err(Error::RipOutOfGuestMemory)
+//         ));
 
-        // bzImage kernel scenario: happy case
-        // The difference is that kernel_load.setup_header is no longer None, because we found one
-        // while parsing the bzImage file.
-        kern_load.kernel_load = GuestAddress(0x0100_0000); // 1 MiB.
-        kern_load.setup_header = Some(setup_header {
-            version: 0x0200, // 0x200 (v2.00) is the minimum.
-            loadflags: 1,
-            ..Default::default()
-        });
-        let expected_load_addr = kern_load.kernel_load.unchecked_add(0x200);
-        let actual_kernel_load_addr = vmm.compute_kernel_load_addr(&kern_load).unwrap();
-        assert_eq!(expected_load_addr, actual_kernel_load_addr);
+//         // bzImage kernel scenario: happy case
+//         // The difference is that kernel_load.setup_header is no longer None, because we found one
+//         // while parsing the bzImage file.
+//         kern_load.kernel_load = GuestAddress(0x0100_0000); // 1 MiB.
+//         kern_load.setup_header = Some(setup_header {
+//             version: 0x0200, // 0x200 (v2.00) is the minimum.
+//             loadflags: 1,
+//             ..Default::default()
+//         });
+//         let expected_load_addr = kern_load.kernel_load.unchecked_add(0x200);
+//         let actual_kernel_load_addr = vmm.compute_kernel_load_addr(&kern_load).unwrap();
+//         assert_eq!(expected_load_addr, actual_kernel_load_addr);
 
-        // bzImage kernel scenario: error case: kernel_load + 0x200 (512 - size of bzImage header)
-        // falls out of guest memory
-        kern_load.kernel_load = GuestAddress(vmm.guest_memory.last_addr().raw_value() - 511);
-        assert!(matches!(
-            vmm.compute_kernel_load_addr(&kern_load),
-            Err(Error::RipOutOfGuestMemory)
-        ));
-    }
+//         // bzImage kernel scenario: error case: kernel_load + 0x200 (512 - size of bzImage header)
+//         // falls out of guest memory
+//         kern_load.kernel_load = GuestAddress(vmm.guest_memory.last_addr().raw_value() - 511);
+//         assert!(matches!(
+//             vmm.compute_kernel_load_addr(&kern_load),
+//             Err(Error::RipOutOfGuestMemory)
+//         ));
+//     }
 
-    #[test]
-    #[cfg(target_arch = "x86_64")]
-    fn test_load_kernel() {
-        // Test Case: load a valid elf.
-        let mut vmm_config = default_vmm_config();
-        vmm_config.kernel_config.path = default_elf_path();
-        // ELF files start with a header that tells us where they want to be loaded.
-        let kernel_load = elf_load_addr(&vmm_config.kernel_config.path);
-        let mut vmm = mock_vmm(vmm_config);
-        let kernel_load_result = vmm.load_kernel().unwrap();
-        assert_eq!(kernel_load_result.kernel_load, kernel_load);
-        assert!(kernel_load_result.setup_header.is_none());
+//     #[test]
+//     #[cfg(target_arch = "x86_64")]
+//     fn test_load_kernel() {
+//         // Test Case: load a valid elf.
+//         let mut vmm_config = default_vmm_config();
+//         vmm_config.kernel_config.path = default_elf_path();
+//         // ELF files start with a header that tells us where they want to be loaded.
+//         let kernel_load = elf_load_addr(&vmm_config.kernel_config.path);
+//         let mut vmm = mock_vmm(vmm_config);
+//         let kernel_load_result = vmm.load_kernel().unwrap();
+//         assert_eq!(kernel_load_result.kernel_load, kernel_load);
+//         assert!(kernel_load_result.setup_header.is_none());
 
-        // Test case: load a valid bzImage.
-        let mut vmm_config = default_vmm_config();
-        vmm_config.kernel_config.path = default_bzimage_path();
-        let mut vmm = mock_vmm(vmm_config);
-        let kernel_load_result = vmm.load_kernel().unwrap();
-        assert_eq!(
-            kernel_load_result.kernel_load,
-            GuestAddress(DEFAULT_HIGH_RAM_START)
-        );
-        assert!(kernel_load_result.setup_header.is_some());
-    }
+//         // Test case: load a valid bzImage.
+//         let mut vmm_config = default_vmm_config();
+//         vmm_config.kernel_config.path = default_bzimage_path();
+//         let mut vmm = mock_vmm(vmm_config);
+//         let kernel_load_result = vmm.load_kernel().unwrap();
+//         assert_eq!(
+//             kernel_load_result.kernel_load,
+//             GuestAddress(DEFAULT_HIGH_RAM_START)
+//         );
+//         assert!(kernel_load_result.setup_header.is_some());
+//     }
 
-    #[test]
-    fn test_load_kernel_errors() {
-        // Test case: kernel file does not exist.
-        let mut vmm_config = default_vmm_config();
-        vmm_config.kernel_config.path = PathBuf::from(TempFile::new().unwrap().as_path());
-        let mut vmm = mock_vmm(vmm_config);
-        assert!(
-            matches!(vmm.load_kernel().unwrap_err(), Error::IO(e) if e.kind() == ErrorKind::NotFound)
-        );
+//     #[test]
+//     fn test_load_kernel_errors() {
+//         // Test case: kernel file does not exist.
+//         let mut vmm_config = default_vmm_config();
+//         vmm_config.kernel_config.path = PathBuf::from(TempFile::new().unwrap().as_path());
+//         let mut vmm = mock_vmm(vmm_config);
+//         assert!(
+//             matches!(vmm.load_kernel().unwrap_err(), Error::IO(e) if e.kind() == ErrorKind::NotFound)
+//         );
 
-        // Test case: kernel image is invalid.
-        let mut vmm_config = default_vmm_config();
-        let temp_file = TempFile::new().unwrap();
-        vmm_config.kernel_config.path = PathBuf::from(temp_file.as_path());
-        let mut vmm = mock_vmm(vmm_config);
+//         // Test case: kernel image is invalid.
+//         let mut vmm_config = default_vmm_config();
+//         let temp_file = TempFile::new().unwrap();
+//         vmm_config.kernel_config.path = PathBuf::from(temp_file.as_path());
+//         let mut vmm = mock_vmm(vmm_config);
 
-        let err = vmm.load_kernel().unwrap_err();
-        #[cfg(target_arch = "x86_64")]
-        assert!(matches!(
-            err,
-            Error::KernelLoad(loader::Error::Bzimage(
-                loader::bzimage::Error::InvalidBzImage
-            ))
-        ));
-        #[cfg(target_arch = "aarch64")]
-        assert!(matches!(
-            err,
-            Error::KernelLoad(loader::Error::Pe(
-                loader::pe::Error::InvalidImageMagicNumber
-            ))
-        ));
+//         let err = vmm.load_kernel().unwrap_err();
+//         #[cfg(target_arch = "x86_64")]
+//         assert!(matches!(
+//             err,
+//             Error::KernelLoad(loader::Error::Bzimage(
+//                 loader::bzimage::Error::InvalidBzImage
+//             ))
+//         ));
+//         #[cfg(target_arch = "aarch64")]
+//         assert!(matches!(
+//             err,
+//             Error::KernelLoad(loader::Error::Pe(
+//                 loader::pe::Error::InvalidImageMagicNumber
+//             ))
+//         ));
 
-        // Test case: kernel path doesn't point to a file.
-        let mut vmm_config = default_vmm_config();
-        let temp_dir = TempDir::new().unwrap();
-        vmm_config.kernel_config.path = PathBuf::from(temp_dir.as_path());
-        let mut vmm = mock_vmm(vmm_config);
-        let err = vmm.load_kernel().unwrap_err();
+//         // Test case: kernel path doesn't point to a file.
+//         let mut vmm_config = default_vmm_config();
+//         let temp_dir = TempDir::new().unwrap();
+//         vmm_config.kernel_config.path = PathBuf::from(temp_dir.as_path());
+//         let mut vmm = mock_vmm(vmm_config);
+//         let err = vmm.load_kernel().unwrap_err();
 
-        #[cfg(target_arch = "x86_64")]
-        assert!(matches!(
-            err,
-            Error::KernelLoad(loader::Error::Elf(loader::elf::Error::ReadElfHeader))
-        ));
-        #[cfg(target_arch = "aarch64")]
-        assert!(matches!(
-            err,
-            Error::KernelLoad(loader::Error::Pe(loader::pe::Error::ReadImageHeader))
-        ));
-    }
+//         #[cfg(target_arch = "x86_64")]
+//         assert!(matches!(
+//             err,
+//             Error::KernelLoad(loader::Error::Elf(loader::elf::Error::ReadElfHeader))
+//         ));
+//         #[cfg(target_arch = "aarch64")]
+//         assert!(matches!(
+//             err,
+//             Error::KernelLoad(loader::Error::Pe(loader::pe::Error::ReadImageHeader))
+//         ));
+//     }
 
-    #[test]
-    #[cfg(target_arch = "aarch64")]
-    fn test_load_kernel() {
-        // Test case: Loading the default & valid image is ok.
-        let vmm_config = default_vmm_config();
-        let mut vmm = mock_vmm(vmm_config);
-        assert!(vmm.load_kernel().is_ok());
-    }
+//     #[test]
+//     #[cfg(target_arch = "aarch64")]
+//     fn test_load_kernel() {
+//         // Test case: Loading the default & valid image is ok.
+//         let vmm_config = default_vmm_config();
+//         let mut vmm = mock_vmm(vmm_config);
+//         assert!(vmm.load_kernel().is_ok());
+//     }
 
-    #[test]
-    fn test_cmdline_updates() {
-        let mut vmm_config = default_vmm_config();
-        vmm_config.kernel_config.path = default_elf_path();
-        let mut vmm = mock_vmm(vmm_config);
-        assert_eq!(vmm.kernel_cfg.cmdline.as_str(), DEFAULT_KERNEL_CMDLINE);
+//     #[test]
+//     fn test_cmdline_updates() {
+//         let mut vmm_config = default_vmm_config();
+//         vmm_config.kernel_config.path = default_elf_path();
+//         let mut vmm = mock_vmm(vmm_config);
+//         assert_eq!(vmm.kernel_cfg.cmdline.as_str(), DEFAULT_KERNEL_CMDLINE);
 
-        vmm.add_serial_console().unwrap();
-        #[cfg(target_arch = "x86_64")]
-        assert!(vmm.kernel_cfg.cmdline.as_str().contains("console=ttyS0"));
-        #[cfg(target_arch = "aarch64")]
-        assert!(vmm
-            .kernel_cfg
-            .cmdline
-            .as_str()
-            .contains("earlycon=uart,mmio"));
-    }
+//         vmm.add_serial_console().unwrap();
+//         #[cfg(target_arch = "x86_64")]
+//         assert!(vmm.kernel_cfg.cmdline.as_str().contains("console=ttyS0"));
+//         #[cfg(target_arch = "aarch64")]
+//         assert!(vmm
+//             .kernel_cfg
+//             .cmdline
+//             .as_str()
+//             .contains("earlycon=uart,mmio"));
+//     }
 
-    #[test]
-    #[cfg(target_arch = "x86_64")]
-    fn test_create_guest_memory() {
-        // Guest memory ends exactly at the MMIO gap: should succeed (last addressable value is
-        // MMIO_GAP_START - 1). There should be 1 memory region.
-        let mut mem_cfg = MemoryConfig {
-            size_mib: (MMIO_GAP_START >> 20) as u32,
-        };
-        let guest_mem = Vmm::create_guest_memory(&mem_cfg).unwrap();
-        assert_eq!(guest_mem.num_regions(), 1);
-        assert_eq!(guest_mem.last_addr(), GuestAddress(MMIO_GAP_START - 1));
+//     #[test]
+//     #[cfg(target_arch = "x86_64")]
+//     fn test_create_guest_memory() {
+//         // Guest memory ends exactly at the MMIO gap: should succeed (last addressable value is
+//         // MMIO_GAP_START - 1). There should be 1 memory region.
+//         let mut mem_cfg = MemoryConfig {
+//             size_mib: (MMIO_GAP_START >> 20) as u32,
+//         };
+//         let guest_mem = Vmm::create_guest_memory(&mem_cfg).unwrap();
+//         assert_eq!(guest_mem.num_regions(), 1);
+//         assert_eq!(guest_mem.last_addr(), GuestAddress(MMIO_GAP_START - 1));
 
-        // Guest memory ends exactly past the MMIO gap: not possible because it's specified in MiB.
-        // But it can end 1 MiB within the MMIO gap. Should succeed.
-        // There will be 2 regions, the 2nd ending at `size_mib << 20 + MMIO_GAP_SIZE`.
-        mem_cfg.size_mib = (MMIO_GAP_START >> 20) as u32 + 1;
-        let guest_mem = Vmm::create_guest_memory(&mem_cfg).unwrap();
-        assert_eq!(guest_mem.num_regions(), 2);
-        assert_eq!(
-            guest_mem.last_addr(),
-            GuestAddress(MMIO_GAP_START + MMIO_GAP_SIZE + (1 << 20) - 1)
-        );
+//         // Guest memory ends exactly past the MMIO gap: not possible because it's specified in MiB.
+//         // But it can end 1 MiB within the MMIO gap. Should succeed.
+//         // There will be 2 regions, the 2nd ending at `size_mib << 20 + MMIO_GAP_SIZE`.
+//         mem_cfg.size_mib = (MMIO_GAP_START >> 20) as u32 + 1;
+//         let guest_mem = Vmm::create_guest_memory(&mem_cfg).unwrap();
+//         assert_eq!(guest_mem.num_regions(), 2);
+//         assert_eq!(
+//             guest_mem.last_addr(),
+//             GuestAddress(MMIO_GAP_START + MMIO_GAP_SIZE + (1 << 20) - 1)
+//         );
 
-        // Guest memory ends exactly at the MMIO gap end: should succeed. There will be 2 regions,
-        // the 2nd ending at `size_mib << 20 + MMIO_GAP_SIZE`.
-        mem_cfg.size_mib = ((MMIO_GAP_START + MMIO_GAP_SIZE) >> 20) as u32;
-        let guest_mem = Vmm::create_guest_memory(&mem_cfg).unwrap();
-        assert_eq!(guest_mem.num_regions(), 2);
-        assert_eq!(
-            guest_mem.last_addr(),
-            GuestAddress(MMIO_GAP_START + 2 * MMIO_GAP_SIZE - 1)
-        );
+//         // Guest memory ends exactly at the MMIO gap end: should succeed. There will be 2 regions,
+//         // the 2nd ending at `size_mib << 20 + MMIO_GAP_SIZE`.
+//         mem_cfg.size_mib = ((MMIO_GAP_START + MMIO_GAP_SIZE) >> 20) as u32;
+//         let guest_mem = Vmm::create_guest_memory(&mem_cfg).unwrap();
+//         assert_eq!(guest_mem.num_regions(), 2);
+//         assert_eq!(
+//             guest_mem.last_addr(),
+//             GuestAddress(MMIO_GAP_START + 2 * MMIO_GAP_SIZE - 1)
+//         );
 
-        // Guest memory ends 1 MiB past the MMIO gap end: should succeed. There will be 2 regions,
-        // the 2nd ending at `size_mib << 20 + MMIO_GAP_SIZE`.
-        mem_cfg.size_mib = ((MMIO_GAP_START + MMIO_GAP_SIZE) >> 20) as u32 + 1;
-        let guest_mem = Vmm::create_guest_memory(&mem_cfg).unwrap();
-        assert_eq!(guest_mem.num_regions(), 2);
-        assert_eq!(
-            guest_mem.last_addr(),
-            GuestAddress(MMIO_GAP_START + 2 * MMIO_GAP_SIZE + (1 << 20) - 1)
-        );
+//         // Guest memory ends 1 MiB past the MMIO gap end: should succeed. There will be 2 regions,
+//         // the 2nd ending at `size_mib << 20 + MMIO_GAP_SIZE`.
+//         mem_cfg.size_mib = ((MMIO_GAP_START + MMIO_GAP_SIZE) >> 20) as u32 + 1;
+//         let guest_mem = Vmm::create_guest_memory(&mem_cfg).unwrap();
+//         assert_eq!(guest_mem.num_regions(), 2);
+//         assert_eq!(
+//             guest_mem.last_addr(),
+//             GuestAddress(MMIO_GAP_START + 2 * MMIO_GAP_SIZE + (1 << 20) - 1)
+//         );
 
-        // Guest memory size is 0: should fail, rejected by vm-memory with EINVAL.
-        mem_cfg.size_mib = 0u32;
-        assert!(matches!(
-            Vmm::create_guest_memory(&mem_cfg),
-            Err(Error::Memory(MemoryError::VmMemory(vm_memory::Error::MmapRegion(vm_memory::mmap::MmapRegionError::Mmap(e)))))
-            if e.kind() == ErrorKind::InvalidInput
-        ));
-    }
+//         // Guest memory size is 0: should fail, rejected by vm-memory with EINVAL.
+//         mem_cfg.size_mib = 0u32;
+//         assert!(matches!(
+//             Vmm::create_guest_memory(&mem_cfg),
+//             Err(Error::Memory(MemoryError::VmMemory(vm_memory::Error::MmapRegion(vm_memory::mmap::MmapRegionError::Mmap(e)))))
+//             if e.kind() == ErrorKind::InvalidInput
+//         ));
+//     }
 
-    #[test]
-    fn test_create_vcpus() {
-        // The scopes force the created vCPUs to unmap their kernel memory at the end.
-        let mut vmm_config = default_vmm_config();
-        vmm_config.vcpu_config = VcpuConfig { num: 0 };
+//     #[test]
+//     fn test_create_vcpus() {
+//         // The scopes force the created vCPUs to unmap their kernel memory at the end.
+//         let mut vmm_config = default_vmm_config();
+//         vmm_config.vcpu_config = VcpuConfig { num: 0 };
 
-        // Creating 0 vCPUs throws an error.
-        {
-            assert!(matches!(
-                Vmm::try_from(vmm_config.clone()),
-                Err(Error::Vm(vm::Error::CreateVmConfig(
-                    vm_vcpu::vcpu::Error::VcpuNumber(0)
-                )))
-            ));
-        }
+//         // Creating 0 vCPUs throws an error.
+//         {
+//             assert!(matches!(
+//                 Vmm::try_from(vmm_config.clone()),
+//                 Err(Error::Vm(vm::Error::CreateVmConfig(
+//                     vm_vcpu::vcpu::Error::VcpuNumber(0)
+//                 )))
+//             ));
+//         }
 
-        // Creating one works.
-        vmm_config.vcpu_config = VcpuConfig { num: 1 };
-        {
-            assert!(Vmm::try_from(vmm_config.clone()).is_ok());
-        }
+//         // Creating one works.
+//         vmm_config.vcpu_config = VcpuConfig { num: 1 };
+//         {
+//             assert!(Vmm::try_from(vmm_config.clone()).is_ok());
+//         }
 
-        // Creating 254 also works (that's the maximum number on x86 when using MP Table).
-        vmm_config.vcpu_config = VcpuConfig { num: 254 };
-        Vmm::try_from(vmm_config).unwrap();
-    }
+//         // Creating 254 also works (that's the maximum number on x86 when using MP Table).
+//         vmm_config.vcpu_config = VcpuConfig { num: 254 };
+//         Vmm::try_from(vmm_config).unwrap();
+//     }
 
-    #[test]
-    #[cfg(target_arch = "x86_64")]
-    // FIXME: We cannot run this on aarch64 because we do not have an image that just runs and
-    // FIXME-continued: halts afterwards. Once we have this, we need to update `default_vmm_config`
-    // FIXME-continued: and have a default PE image on aarch64.
-    fn test_add_block() {
-        let vmm_config = default_vmm_config();
-        let mut vmm = mock_vmm(vmm_config);
+//     #[test]
+//     #[cfg(target_arch = "x86_64")]
+//     // FIXME: We cannot run this on aarch64 because we do not have an image that just runs and
+//     // FIXME-continued: halts afterwards. Once we have this, we need to update `default_vmm_config`
+//     // FIXME-continued: and have a default PE image on aarch64.
+//     fn test_add_block() {
+//         let vmm_config = default_vmm_config();
+//         let mut vmm = mock_vmm(vmm_config);
 
-        let tempfile = TempFile::new().unwrap();
-        let block_config = BlockConfig {
-            path: tempfile.as_path().to_path_buf(),
-        };
+//         let tempfile = TempFile::new().unwrap();
+//         let block_config = BlockConfig {
+//             path: tempfile.as_path().to_path_buf(),
+//         };
 
-        assert!(vmm.add_block_device(&block_config).is_ok());
-        assert_eq!(vmm.block_devices.len(), 1);
-        assert!(vmm.kernel_cfg.cmdline.as_str().contains("virtio"));
+//         assert!(vmm.add_block_device(&block_config).is_ok());
+//         assert_eq!(vmm.block_devices.len(), 1);
+//         assert!(vmm.kernel_cfg.cmdline.as_str().contains("virtio"));
 
-        let invalid_block_config = BlockConfig {
-            // Let's create the tempfile directly here so that it gets out of scope immediately
-            // and delete the underlying file.
-            path: TempFile::new().unwrap().as_path().to_path_buf(),
-        };
+//         let invalid_block_config = BlockConfig {
+//             // Let's create the tempfile directly here so that it gets out of scope immediately
+//             // and delete the underlying file.
+//             path: TempFile::new().unwrap().as_path().to_path_buf(),
+//         };
 
-        let err = vmm.add_block_device(&invalid_block_config).unwrap_err();
-        assert!(
-            matches!(err, Error::Block(block::Error::OpenFile(io_err)) if io_err.kind() == ErrorKind::NotFound)
-        );
+//         let err = vmm.add_block_device(&invalid_block_config).unwrap_err();
+//         assert!(
+//             matches!(err, Error::Block(block::Error::OpenFile(io_err)) if io_err.kind() == ErrorKind::NotFound)
+//         );
 
-        // The current implementation of the VMM does not allow more than one block device
-        // as we are hard coding the `MmioConfig`.
-        // This currently fails because a device is already registered with the provided
-        // MMIO range.
-        assert!(vmm.add_block_device(&block_config).is_err());
-    }
+//         // The current implementation of the VMM does not allow more than one block device
+//         // as we are hard coding the `MmioConfig`.
+//         // This currently fails because a device is already registered with the provided
+//         // MMIO range.
+//         assert!(vmm.add_block_device(&block_config).is_err());
+//     }
 
-    #[test]
-    #[cfg(target_arch = "x86_64")]
-    // FIXME: We cannot run this on aarch64 because we do not have an image that just runs and
-    // FIXME-continued: halts afterwards. Once we have this, we need to update `default_vmm_config`
-    // FIXME-continued: and have a default PE image on aarch64.
-    fn test_add_net() {
-        let vmm_config = default_vmm_config();
-        let mut vmm = mock_vmm(vmm_config);
+//     #[test]
+//     #[cfg(target_arch = "x86_64")]
+//     // FIXME: We cannot run this on aarch64 because we do not have an image that just runs and
+//     // FIXME-continued: halts afterwards. Once we have this, we need to update `default_vmm_config`
+//     // FIXME-continued: and have a default PE image on aarch64.
+//     fn test_add_net() {
+//         let vmm_config = default_vmm_config();
+//         let mut vmm = mock_vmm(vmm_config);
 
-        // The device only attempts to open the tap interface during activation, so we can
-        // specify any name here for now.
-        let cfg = NetConfig {
-            tap_name: "imaginary_tap".to_owned(),
-        };
+//         // The device only attempts to open the tap interface during activation, so we can
+//         // specify any name here for now.
+//         let cfg = NetConfig {
+//             tap_name: "imaginary_tap".to_owned(),
+//         };
 
-        {
-            assert!(vmm.add_net_device(&cfg).is_ok());
-            assert_eq!(vmm.net_devices.len(), 1);
-            assert!(vmm.kernel_cfg.cmdline.as_str().contains("virtio"));
-        }
+//         {
+//             assert!(vmm.add_net_device(&cfg).is_ok());
+//             assert_eq!(vmm.net_devices.len(), 1);
+//             assert!(vmm.kernel_cfg.cmdline.as_str().contains("virtio"));
+//         }
 
-        {
-            // The current implementation of the VMM does not allow more than one net device
-            // as we are hard coding the `MmioConfig`.
-            // This currently fails because a device is already registered with the provided
-            // MMIO range.
-            assert!(vmm.add_net_device(&cfg).is_err());
-        }
-    }
+//         {
+//             // The current implementation of the VMM does not allow more than one net device
+//             // as we are hard coding the `MmioConfig`.
+//             // This currently fails because a device is already registered with the provided
+//             // MMIO range.
+//             assert!(vmm.add_net_device(&cfg).is_err());
+//         }
+//     }
 
-    #[test]
-    #[cfg(target_arch = "aarch64")]
-    fn test_setup_fdt() {
-        let vmm_config = default_vmm_config();
-        let mut vmm = mock_vmm(vmm_config);
+//     #[test]
+//     #[cfg(target_arch = "aarch64")]
+//     fn test_setup_fdt() {
+//         let vmm_config = default_vmm_config();
+//         let mut vmm = mock_vmm(vmm_config);
 
-        {
-            let result = vmm.setup_fdt();
-            assert!(result.is_ok());
-        }
+//         {
+//             let result = vmm.setup_fdt();
+//             assert!(result.is_ok());
+//         }
 
-        {
-            let mem_size: u64 = vmm.guest_memory.iter().map(|region| region.len()).sum();
-            let fdt_offset = mem_size + AARCH64_FDT_MAX_SIZE;
-            let fdt = FdtBuilder::new()
-                .with_cmdline(vmm.kernel_cfg.cmdline.as_str())
-                .with_num_vcpus(vmm.num_vcpus.try_into().unwrap())
-                .with_mem_size(mem_size)
-                .with_serial_console(0x40000000, 0x1000)
-                .with_rtc(0x40001000, 0x1000)
-                .create_fdt()
-                .unwrap();
-            assert!(fdt.write_to_mem(&vmm.guest_memory, fdt_offset).is_err());
-        }
-    }
-}
+//         {
+//             let mem_size: u64 = vmm.guest_memory.iter().map(|region| region.len()).sum();
+//             let fdt_offset = mem_size + AARCH64_FDT_MAX_SIZE;
+//             let fdt = FdtBuilder::new()
+//                 .with_cmdline(vmm.kernel_cfg.cmdline.as_str())
+//                 .with_num_vcpus(vmm.num_vcpus.try_into().unwrap())
+//                 .with_mem_size(mem_size)
+//                 .with_serial_console(0x40000000, 0x1000)
+//                 .with_rtc(0x40001000, 0x1000)
+//                 .create_fdt()
+//                 .unwrap();
+//             assert!(fdt.write_to_mem(&vmm.guest_memory, fdt_offset).is_err());
+//         }
+//     }
+// }
