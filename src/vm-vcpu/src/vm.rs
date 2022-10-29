@@ -500,6 +500,7 @@ impl<EH: 'static + ExitHandler + Send> KvmVm<EH> {
         }
 
         KvmVcpu::setup_signal_handler().unwrap();
+        // self.vcpu_run_state.set_and_notify(VmRunState::Running);
 
         for (id, mut vcpu) in self.vcpus.drain(..).enumerate() {
             let vcpu_exit_handler = self.exit_handler.clone();
@@ -514,7 +515,9 @@ impl<EH: 'static + ExitHandler + Send> KvmVm<EH> {
                 .map_err(Error::RunVcpus)?;
             self.vcpu_handles.push(vcpu_handle);
         }
-
+        println!("Setting up signal handler");
+        self.vcpu_run_state.set_and_notify(VmRunState::Running);
+        // let _ = self.exit_handler.kick();
         Ok(())
     }
 

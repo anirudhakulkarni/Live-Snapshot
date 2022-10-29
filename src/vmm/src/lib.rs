@@ -648,7 +648,27 @@ impl Vmm {
         else{
             kernel_load_addr = GuestAddress(0);
         }
-
+        // TRASH. DOES NOT DO ANYTHING
+        // save and restore memory here
+        // Self::take_snapshot("tmp_cpu.txt", "tmp_memory.txt", &self.vm.save_state().unwrap(), &self.guest_memory);
+        // let vm_state = Self::restore_cpu("tmp_cpu.txt");
+        // println!("restoring snapshot before vm.run");
+        // let mem_size = ((256 as u64) << 20) as usize; //TODO: hardcoded
+        // let memory_state = get_memory_state(mem_size);
+        // let file = File::options()
+        //                 .write(true)
+        //                 .read(true)
+        //                 .open("mem.txt")
+        //                 .unwrap();
+        // let mem_regions = vec![
+        //                 (None, GuestAddress(0), mem_size)
+        //             ];
+        // let guest_memory = vm_memory::create_guest_memory(&mem_regions[..], true).unwrap();
+            
+        // // let guest_memory = GuestMemoryMmap::restore(Some(&file), &memory_state, false);
+        // self.guest_memory= guest_memory ;
+        // // self.vm = KvmVm::from_state(self, vmstate, &guest_memory,self.exit_handler, self.device_mgr).unwrap();
+        // println!("restored snapshot before vm.run");
         println!("FLOW: Starting VM");        
         self.vm.run(Some(kernel_load_addr), self.is_resume).map_err(Error::Vm)?;
         
