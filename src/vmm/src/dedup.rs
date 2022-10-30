@@ -210,13 +210,13 @@ impl DedupManager {
 
     }
 
-    pub fn load_file(&self, path: &Path) -> std::io::Result<Vec<u8>> {
+    pub fn load_file(&self, path: &str) {
         let mut hashtochunk= checkifexist(&self.MAP1_PATH);
         let mut filetohashes = checkifexist(&self.MAP2_PATH);
         // println!("{:?}", hashtochunk);
         // println!("{:?}", filetohashes);
         
-        let hashes = filetohashes.get(path.to_str().unwrap()).unwrap();
+        let hashes = filetohashes.get(path).unwrap();
         // println!("{:?}", hashes);
         let mut chunks= Vec::new();
         for hash in hashes {
@@ -234,10 +234,15 @@ impl DedupManager {
         for chunk in chunks {
             buffer.extend(chunk);
         }
+        let mut file = File::options()
+            .write(true)
+            .create(true)
+            .open(path)
+            .unwrap();
+        file.write_all(&buffer).unwrap();
         // save file as file.txt
         // let mut file = File::create("file.jpeg").unwrap();
         // file.write_all(&buffer).unwrap();
-        Ok(buffer)
     }
 
 }

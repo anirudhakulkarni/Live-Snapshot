@@ -417,6 +417,7 @@ impl TryFrom<VMMConfig> for Vmm {
             // guest_memory = GuestMemoryMmap::restore(Some(memory_file.as_file()), &memory_state, false);
 
             let memory_state = get_memory_state(mem_size);
+            dedup_mgr.load_file(&memory_snapshot_path);
             let file = File::options()
                 .write(true)
                 .read(true)
@@ -595,8 +596,7 @@ impl Vmm {
         SnapshotMemory::dump(guest_memory, &mut writer);
         writer.flush().unwrap();
         writer.sync_all().unwrap();
-        
-
+        dedup_mgr.save_file(memory_path);
     }
 
     ///
