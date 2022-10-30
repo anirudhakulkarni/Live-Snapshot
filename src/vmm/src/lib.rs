@@ -9,7 +9,7 @@ use std::convert::TryInto;
 use std::fs::File;
 use std::io::{self, stdin, stdout, Read};
 use std::ops::DerefMut;
-use std::path::PathBuf;
+use std::path::{PathBuf, Path};
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -61,10 +61,11 @@ pub use config::*;
 use devices::virtio::block::{self, BlockArgs};
 use devices::virtio::net::{self, NetArgs};
 use devices::virtio::{Env, MmioConfig};
+pub mod dedup;
 pub mod memory_snapshot;
 
 use crate::memory_snapshot::{GuestMemoryRegionState, GuestMemoryState, SnapshotMemory};
-
+use crate::dedup::DedupManager;
 // use memory_snapshot::{GuestMemoryRegionState, GuestMemoryState};
 #[cfg(target_arch = "x86_64")]
 use devices::legacy::I8042Wrapper;
@@ -117,6 +118,17 @@ pub const DEFAULT_KERNEL_CMDLINE: &str = "panic=1 pci=off";
 #[cfg(target_arch = "aarch64")]
 /// Default kernel command line.
 pub const DEFAULT_KERNEL_CMDLINE: &str = "reboot=t panic=1 pci=off";
+
+const CHUNK_SIZE: usize = 1024 *1024;
+
+// constants: database path, state path, map1 path, map2 path
+const DATABASE_PATH: &str = "./database/";
+// state path is database path + state
+const STATE_PATH: &str = "./database/state";
+// map1 path is database path + map1
+const MAP1_PATH: &str = "./database/map1";
+// map2 path is database path + map2
+const MAP2_PATH: &str = "./database/map2";
 
 /// VMM memory related errors.
 #[derive(Debug)]
@@ -253,6 +265,7 @@ pub struct Vmm {
     #[cfg(target_arch = "aarch64")]
     pub num_vcpus: u64,
     pub is_resume: bool,
+    pub dedup_mgr: DedupManager,
     // pub kvm: Kvm
 }
 
@@ -374,6 +387,14 @@ impl TryFrom<VMMConfig> for Vmm {
         let mut is_resume = false;
         let mem_size = ((config.memory_config.size_mib as u64) << 20) as usize;
 
+        let dedup_mgr : DedupManager = DedupManager{
+            CHUNK_SIZE,
+            DATABASE_PATH: DATABASE_PATH.to_string(),
+            STATE_PATH: STATE_PATH.to_string(),
+            MAP1_PATH: MAP1_PATH.to_string(),
+            MAP2_PATH: MAP2_PATH.to_string()
+        };
+
         let my_vm = if config.snapshot_config.is_none() {
             let mem_regions = vec![(None, GuestAddress(0), mem_size)];
             guest_memory = vm_memory::create_guest_memory(&mem_regions[..], true).unwrap();
@@ -392,7 +413,7 @@ impl TryFrom<VMMConfig> for Vmm {
             let cpu_snapshot_path = config.snapshot_config.unwrap().cpu_snapshot_path;
 
             // println!("restoring snapshot");
-            let vmstate = Self::restore_cpu(&cpu_snapshot_path[..]);
+            let vmstate = Self::restore_cpu(&cpu_snapshot_path[..], &dedup_mgr);
             // guest_memory = GuestMemoryMmap::restore(Some(memory_file.as_file()), &memory_state, false);
 
             let memory_state = get_memory_state(mem_size);
@@ -414,6 +435,8 @@ impl TryFrom<VMMConfig> for Vmm {
             .unwrap()
         };
 
+        
+
         let mut vmm = Vmm {
             vm: my_vm,
             guest_memory,
@@ -427,6 +450,7 @@ impl TryFrom<VMMConfig> for Vmm {
             #[cfg(target_arch = "aarch64")]
             num_vcpus: config.vcpu_config.num as u64,
             is_resume: is_resume,
+            dedup_mgr: dedup_mgr
             // kvm: kvm
         };
 
@@ -513,6 +537,7 @@ impl Vmm {
             memory_snapshot_path,
             &vm_state,
             &self.guest_memory,
+            &self.dedup_mgr
         );
 
         // NOTE: 4. Set and notify all vcpus to Running state so that they breaks out of their wait loop and resumes
@@ -544,6 +569,7 @@ impl Vmm {
             memory_snapshot_path,
             &vm_state,
             &self.guest_memory,
+            &self.dedup_mgr
         );
 
         // Now, make the vmm exit out of run loop
@@ -555,8 +581,9 @@ impl Vmm {
         memory_path: &str,
         vm_state: &VmState,
         guest_memory: &GuestMemoryMmap,
+        dedup_mgr: &DedupManager
     ) {
-        Self::save_cpu(snapshot_path, vm_state);
+        Self::save_cpu(snapshot_path, vm_state, dedup_mgr);
 
         // std::fs::copy("memory.txt", memory_path);
         let mut writer = File::options()
@@ -571,21 +598,23 @@ impl Vmm {
     }
 
     ///
-    pub fn save_cpu(snapshot_path: &str, vm_state: &VmState) {
+    pub fn save_cpu(snapshot_path: &str, vm_state: &VmState, dedup_mgr: &DedupManager) {
         let mut snapshot_file = File::create(snapshot_path).unwrap();
         let mut mem = Vec::new();
         let version_map = VersionMap::new();
         vm_state.serialize(&mut mem, &version_map, 1).unwrap();
         snapshot_file.write_all(&mem).unwrap();
+        dedup_mgr.save_file(snapshot_path);
     }
 
     /// restore cpu
-    pub fn restore_cpu(snapshot_path: &str) -> VmState {
-        let mut snapshot_file = File::open(snapshot_path).unwrap();
+    pub fn restore_cpu(snapshot_path: &str, dedup_mgr: &DedupManager) -> VmState {
+        // let mut snapshot_file = File::open(snapshot_path).unwrap();
         let version_map = VersionMap::new();
-        let mut bytes = Vec::new();
+        // let mut bytes = Vec::new();
 
-        snapshot_file.read_to_end(&mut bytes).unwrap();
+        // snapshot_file.read_to_end(&mut bytes).unwrap();
+        let bytes = dedup_mgr.load_file(Path::new(snapshot_path)).unwrap();
         VmState::deserialize(&mut bytes.as_slice(), &version_map, 1).unwrap()
     }
 
