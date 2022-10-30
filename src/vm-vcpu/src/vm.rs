@@ -40,10 +40,10 @@ pub struct VmConfig {
 
 impl VmConfig {
     /// Creates a default `VmConfig` for `num_vcpus`.
-    pub fn new(kvm: &Kvm, num_vcpus: u8) -> Result<Self> {
+    pub fn new(kvm: &Kvm, num_vcpus: u8, starter_path: String) -> Result<Self> {
         Ok(VmConfig {
             num_vcpus,
-            vcpus_config: VcpuConfigList::new(kvm, num_vcpus).map_err(Error::CreateVmConfig)?,
+            vcpus_config: VcpuConfigList::new(kvm, num_vcpus, starter_path).map_err(Error::CreateVmConfig)?,
         })
     }
 }
