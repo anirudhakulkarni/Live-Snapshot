@@ -413,10 +413,11 @@ impl TryFrom<VMMConfig> for Vmm {
             let cpu_snapshot_path = config.snapshot_config.unwrap().cpu_snapshot_path;
 
             // println!("restoring snapshot");
-            let vmstate = Self::restore_cpu(&cpu_snapshot_path[..], &dedup_mgr);
+            let vmstate = Self::restore_cpu(&cpu_snapshot_path[..]);
             // guest_memory = GuestMemoryMmap::restore(Some(memory_file.as_file()), &memory_state, false);
 
             let memory_state = get_memory_state(mem_size);
+            dedup_mgr.load_file(&memory_snapshot_path);
             let file = File::options()
                 .write(true)
                 .read(true)
@@ -583,7 +584,7 @@ impl Vmm {
         guest_memory: &GuestMemoryMmap,
         dedup_mgr: &DedupManager
     ) {
-        Self::save_cpu(snapshot_path, vm_state, dedup_mgr);
+        Self::save_cpu(snapshot_path, vm_state);
 
         // std::fs::copy("memory.txt", memory_path);
         let mut writer = File::options()
@@ -595,26 +596,24 @@ impl Vmm {
         SnapshotMemory::dump(guest_memory, &mut writer);
         writer.flush().unwrap();
         writer.sync_all().unwrap();
+        dedup_mgr.save_file(memory_path);
     }
 
     ///
-    pub fn save_cpu(snapshot_path: &str, vm_state: &VmState, dedup_mgr: &DedupManager) {
+    pub fn save_cpu(snapshot_path: &str, vm_state: &VmState) {
         let mut snapshot_file = File::create(snapshot_path).unwrap();
         let mut mem = Vec::new();
         let version_map = VersionMap::new();
         vm_state.serialize(&mut mem, &version_map, 1).unwrap();
         snapshot_file.write_all(&mem).unwrap();
-        dedup_mgr.save_file(snapshot_path);
     }
 
     /// restore cpu
-    pub fn restore_cpu(snapshot_path: &str, dedup_mgr: &DedupManager) -> VmState {
-        // let mut snapshot_file = File::open(snapshot_path).unwrap();
+    pub fn restore_cpu(snapshot_path: &str) -> VmState {
+        let mut snapshot_file = File::open(snapshot_path).unwrap();
         let version_map = VersionMap::new();
-        // let mut bytes = Vec::new();
-
-        // snapshot_file.read_to_end(&mut bytes).unwrap();
-        let bytes = dedup_mgr.load_file(Path::new(snapshot_path)).unwrap();
+        let mut bytes = Vec::new();
+        snapshot_file.read_to_end(&mut bytes).unwrap();
         VmState::deserialize(&mut bytes.as_slice(), &version_map, 1).unwrap()
     }
 
