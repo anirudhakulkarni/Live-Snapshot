@@ -8,3 +8,6 @@ cargo run -- --kernel path=../../bzimage-hello-busybox --port 10010 --net tap="v
 
 make the vm sleep 
 sleep 1 && echo 0 && sleep 1 && echo 1 && sleep 1 && echo 2 && sleep 1 && echo 3 && sleep 1 && echo 4 && sleep 1 && echo 5 && sleep 1 && echo 6 && sleep 1 && echo 7 
+
+
+cargo run --bin simple pause cpu.txt mem.txt 10010 true

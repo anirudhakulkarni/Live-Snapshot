@@ -368,8 +368,8 @@ impl TryFrom<VMMConfig> for Vmm {
         let device_mgr = Arc::new(Mutex::new(IoManager::new()));
 
         // Create the KvmVm.
-        let vm_config = VmConfig::new(&kvm, config.vcpu_config.num)?;
-
+        let vm_config = VmConfig::new(&kvm, config.vcpu_config.num, config.kernel_config.clone().starter_path)?;
+        
         let wrapped_exit_handler = WrappedExitHandler::new()?;
 
         let mut event_manager = EventManager::<Arc<Mutex<dyn MutEventSubscriber + Send>>>::new()

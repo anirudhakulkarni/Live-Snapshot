@@ -36,8 +36,7 @@ impl Cli {
                     .long("kernel")
                     .required(true)
                     .takes_value(true)
-                    .help("Kernel configuration.\n\tFormat: \"path=<string>[,cmdline=<string>,kernel_load_addr=<u64>]\""),
-            )
+                    .help("Kernel configuration.\n\tFormat: \"path=<string>[,cmdline=<string>,kernel_load_addr=<u64>],starter_file=<string>\""),            )
             .arg(
                 Arg::with_name("net")
                     .long("net")
