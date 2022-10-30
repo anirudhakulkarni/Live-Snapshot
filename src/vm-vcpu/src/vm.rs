@@ -83,6 +83,7 @@ pub struct KvmVm<EH: ExitHandler + Send> {
     pub vcpu_barrier: Arc<Barrier>,
     pub vcpu_run_state: Arc<VcpuRunState>,
     pub vcpu_rx: Option<Receiver<i32>>,
+    pub vcpu_states: Vec<Arc<Mutex<Option<VcpuState>>>>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -209,7 +210,8 @@ impl<EH: 'static + ExitHandler + Send> KvmVm<EH> {
             vcpu_handles: Vec::new(),
             exit_handler,
             vcpu_run_state,
-            vcpu_rx: None
+            vcpu_rx: None,
+            vcpu_states: Vec::new()
         };
         vm.configure_memory_regions(guest_memory, kvm)?;
 
@@ -504,6 +506,7 @@ impl<EH: 'static + ExitHandler + Send> KvmVm<EH> {
 
         for (id, mut vcpu) in self.vcpus.drain(..).enumerate() {
             let vcpu_exit_handler = self.exit_handler.clone();
+            self.vcpu_states.push(vcpu.vcpu_state.clone());
             let vcpu_handle = thread::Builder::new()
                 .name(format!("vcpu_{}", id))
                 .spawn(move || {
@@ -592,22 +595,21 @@ impl<EH: 'static + ExitHandler + Send> KvmVm<EH> {
             .get_irqchip(&mut ioapic)
             .map_err(Error::VmGetIrqChip)?;
 
-        // let vcpus_state = self
-        //     .vcpus
-        //     .iter_mut()
-        //     .map(|vcpu| vcpu.save_state())
-        //     .collect::<vcpu::Result<Vec<VcpuState>>>()
-        //     .map_err(Error::SaveVcpuState)?;
+        let mut vcpus_state = Vec::new();
+        for vcpu_state in &self.vcpu_states{
+            vcpus_state.push(vcpu_state.lock().unwrap().clone().unwrap());
+        }
+            // .map_err(Error::SaveVcpuState)?;
 
         // TODO: Sachin look here
-        let mut file = File::open("suspend.txt").unwrap();
-        // let mut vcpu_state:VcpuState = serde_json::from_str(&fs::read_to_string("suspend.txt").unwrap()).unwrap();
-        let mut version_map = VersionMap::new();
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes).unwrap();
-        // println!("vec: {:?}", bytes);
-        let mut vcpus_state=Vec::new();
-        vcpus_state.push(VcpuState::deserialize(&mut bytes.as_slice(), &version_map, 1).unwrap());
+        // let mut file = File::open("suspend.txt").unwrap();
+        // // let mut vcpu_state:VcpuState = serde_json::from_str(&fs::read_to_string("suspend.txt").unwrap()).unwrap();
+        // let mut version_map = VersionMap::new();
+        // let mut bytes = Vec::new();
+        // file.read_to_end(&mut bytes).unwrap();
+        // // println!("vec: {:?}", bytes);
+        // let mut vcpus_state=Vec::new();
+        // vcpus_state.push(VcpuState::deserialize(&mut bytes.as_slice(), &version_map, 1).unwrap());
     
 
         Ok(VmState {
