@@ -4,3 +4,4 @@ bzimage-*
 *.ext4
 __pycache__
 *.txt
+database
