@@ -1,6 +1,6 @@
 // Copyright 2020 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0 OR BSD-3-Clause
-use std::{convert::TryFrom, net::IpAddr, env};
+use std::{convert::TryFrom, env, net::IpAddr};
 
 use futures::{future, prelude::*};
 use tarpc::{
@@ -9,50 +9,62 @@ use tarpc::{
     tokio_serde::formats::Json,
 };
 
+use api::Cli;
 use std::sync::{atomic::Ordering, Arc, Mutex};
 use vmm::{RpcController, Vmm};
-use api::Cli;
-                                                                                                                                                                                                                                                                                                                                                                                         
+
 /// This is the service definition. It looks a lot like a trait definition.
 /// It defines one RPC, hello, which takes one arg, name, and returns a String.
 #[tarpc::service]
 pub trait World {
-    async fn snapshot_and_resume(cpu_snapshotpath: String, memory_snapshot_path: String, port: u16) -> String;
-    async fn snapshot_and_pause(cpu_snapshot_path: String, memory_snapshot_path: String, port: u16, resume: bool) -> String;
+    async fn snapshot_and_resume(
+        cpu_snapshotpath: String,
+        memory_snapshot_path: String,
+        port: u16,
+    ) -> String;
+    async fn snapshot_and_pause(
+        cpu_snapshot_path: String,
+        memory_snapshot_path: String,
+        port: u16,
+        resume: bool,
+    ) -> String;
 }
 
 #[derive(Clone)]
-struct RPCServer{
+struct RPCServer {
     rpc_controller: Arc<Mutex<RpcController>>,
 }
 
 #[tarpc::server]
 impl World for RPCServer {
-    // async fn snapshot_and_pause(self, _: context::Context, cpu_snapshot_path: String, memory_snapshot_path: String, port: u16) -> String {
-    //     println!("RPC Call: Snapshot and Pause");
-    //     let mut rpc_controller = self.rpc_controller.lock().unwrap();
-    //     rpc_controller.cpu_snapshot_path = cpu_snapshot_path;
-    //     rpc_controller.memory_snapshot_path = memory_snapshot_path;
-    //     rpc_controller.pause_or_resume.store(1, Ordering::Relaxed);
-    //     rpc_controller.event_fd.write(1).unwrap();
-    //     "Success".to_string()
-    // }
-    async fn snapshot_and_pause(self, _: context::Context, cpu_snapshot_path: String, memory_snapshot_path: String, port: u16, resume: bool) -> String {
+    async fn snapshot_and_pause(
+        self,
+        _: context::Context,
+        cpu_snapshot_path: String,
+        memory_snapshot_path: String,
+        port: u16,
+        resume: bool,
+    ) -> String {
         println!("RPC Call: Snapshot and Pause");
         let mut rpc_controller = self.rpc_controller.lock().unwrap();
         rpc_controller.cpu_snapshot_path = cpu_snapshot_path;
         rpc_controller.memory_snapshot_path = memory_snapshot_path;
-        if resume{
+        if resume {
             rpc_controller.pause_or_resume.store(2, Ordering::Relaxed);
-        }
-        else{
+        } else {
             rpc_controller.pause_or_resume.store(1, Ordering::Relaxed);
         }
 
         rpc_controller.event_fd.write(1).unwrap();
         "Success".to_string()
     }
-    async fn snapshot_and_resume(self, _: context::Context, cpu_snapshot_path: String, memory_snapshot_path: String, port: u16) -> String {
+    async fn snapshot_and_resume(
+        self,
+        _: context::Context,
+        cpu_snapshot_path: String,
+        memory_snapshot_path: String,
+        port: u16,
+    ) -> String {
         println!("RPC Call: Snapshot and Resume");
         let mut rpc_controller = self.rpc_controller.lock().unwrap();
         rpc_controller.cpu_snapshot_path = cpu_snapshot_path;
@@ -74,7 +86,8 @@ async fn main() {
     ) {
         Ok(vmm_config) => {
             let config = vmm_config.clone();
-            let mut vmm = Vmm::try_from(vmm_config).expect("Failed to create VMM from configurations");
+            let mut vmm =
+                Vmm::try_from(vmm_config).expect("Failed to create VMM from configurations");
             println!("RPC config:{:?}", config.rpc_config);
             let ip = "127.0.0.1";
             let port = config.rpc_config.as_ref().unwrap().port.clone();
@@ -83,7 +96,9 @@ async fn main() {
                 let server_addr = (IpAddr::V4(ip.parse().unwrap()), port);
                 // JSON transport is provided by the json_transport tarpc module. It makes it easy
                 // to start up a serde-powered json serialization strategy over TCP.
-                let mut listener = tarpc::serde_transport::tcp::listen(&server_addr, Json::default).await.unwrap();
+                let mut listener = tarpc::serde_transport::tcp::listen(&server_addr, Json::default)
+                    .await
+                    .unwrap();
 
                 listener.config_mut().max_frame_length(usize::MAX);
                 println!("Starting RPC Listener");
@@ -96,17 +111,16 @@ async fn main() {
                     // serve is generated by the service attribute. It takes as input any type implementing
                     // the generated World trait.
                     .map(|channel| {
-                        let server = RPCServer{
+                        let server = RPCServer {
                             rpc_controller: Arc::clone(&rpc_controller),
                         };
                         channel.execute(server.serve())
                     })
                     // Max 10 channels.
                     .buffer_unordered(10)
-                    .for_each(|_| async {
-                    })
+                    .for_each(|_| async {})
                     .await;
-                    println!("Exiting RPC Listener");
+                println!("Exiting RPC Listener");
             });
             // For now we are just unwrapping here, in the future we might use a nicer way of
             // handling errors such as pretty printing them.

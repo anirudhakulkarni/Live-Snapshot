@@ -10,7 +10,7 @@ use std::fs::File;
 use std::io::{self, stdin, stdout, Read};
 use std::ops::DerefMut;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering, AtomicU16};
+use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::{Arc, Mutex};
 
 use event_manager::{EventManager, EventOps, Events, MutEventSubscriber, SubscriberOps};
@@ -19,7 +19,6 @@ use kvm_ioctls::{
     Cap::{self, Ioeventfd, Irqchip, Irqfd, UserMemory},
     Kvm,
 };
-use libc::mmap;
 use linux_loader::cmdline;
 #[cfg(target_arch = "x86_64")]
 use linux_loader::configurator::{
@@ -45,7 +44,7 @@ use vm_device::device_manager::MmioManager;
 use vm_device::device_manager::PioManager;
 #[cfg(target_arch = "aarch64")]
 use vm_memory::GuestMemoryRegion;
-use vm_memory::{GuestAddress, GuestMemory, GuestMemoryMmap, FileOffset, Bytes, MemoryRegionAddress, };
+use vm_memory::{GuestAddress, GuestMemory, GuestMemoryMmap};
 #[cfg(target_arch = "x86_64")]
 use vm_superio::I8042Device;
 #[cfg(target_arch = "aarch64")]
@@ -64,16 +63,15 @@ use devices::virtio::net::{self, NetArgs};
 use devices::virtio::{Env, MmioConfig};
 pub mod memory_snapshot;
 
-use crate::memory_snapshot::{GuestMemoryState, GuestMemoryRegionState, SnapshotMemory, };
+use crate::memory_snapshot::{GuestMemoryRegionState, GuestMemoryState, SnapshotMemory};
 
 // use memory_snapshot::{GuestMemoryRegionState, GuestMemoryState};
 #[cfg(target_arch = "x86_64")]
 use devices::legacy::I8042Wrapper;
-use devices::legacy::{EventFdTrigger, SerialWrapper};
-use vm_vcpu::vm::{self, ExitHandler, KvmVm, VmConfig, VmState, VmRunState};
-use vm_memory::GuestMemoryRegion;
 #[cfg(target_arch = "aarch64")]
 use devices::legacy::RtcWrapper;
+use devices::legacy::{EventFdTrigger, SerialWrapper};
+use vm_vcpu::vm::{self, ExitHandler, KvmVm, VmConfig, VmRunState, VmState};
 
 #[cfg(target_arch = "aarch64")]
 use arch::{FdtBuilder, AARCH64_FDT_MAX_SIZE, AARCH64_MMIO_BASE, AARCH64_PHYS_MEM_START};
@@ -81,9 +79,8 @@ use arch::{FdtBuilder, AARCH64_FDT_MAX_SIZE, AARCH64_MMIO_BASE, AARCH64_PHYS_MEM
 mod boot;
 mod config;
 
-use versionize::{VersionMap, Versionize, VersionizeResult};
-use versionize_derive::Versionize;
 use std::io::Write;
+use versionize::{VersionMap, Versionize};
 
 /// First address past 32 bits is where the MMIO gap ends.
 pub(crate) const MMIO_GAP_END: u64 = 1 << 32;
@@ -187,30 +184,30 @@ pub type Result<T> = std::result::Result<T, Error>;
 type Block = block::Block<Arc<GuestMemoryMmap>>;
 type Net = net::Net<Arc<GuestMemoryMmap>>;
 
-
 pub struct RpcController {
-    pub event_fd : EventFd,
+    pub event_fd: EventFd,
     pub pause_or_resume: AtomicU16,
     pub cpu_snapshot_path: String,
-    pub memory_snapshot_path: String
+    pub memory_snapshot_path: String,
 }
 
 impl RpcController {
     fn new() -> RpcController {
         RpcController {
-            event_fd: EventFd::new(libc::EFD_NONBLOCK).map_err(Error::ExitEvent).unwrap(),
+            event_fd: EventFd::new(libc::EFD_NONBLOCK)
+                .map_err(Error::ExitEvent)
+                .unwrap(),
             pause_or_resume: AtomicU16::new(0),
             cpu_snapshot_path: "".to_string(),
             memory_snapshot_path: "".to_string(),
             // 0 mean nothing, 1 mean pause, 2 mean resume.
         }
     }
-    fn which_event(&self) -> &'static str{
+    fn which_event(&self) -> &'static str {
         let val = self.pause_or_resume.load(Ordering::Acquire);
         if val == 1 {
             return "PAUSE";
-        }
-        else if val == 2{
+        } else if val == 2 {
             return "RESUME";
         }
         "5 star"
@@ -257,7 +254,6 @@ pub struct Vmm {
     pub num_vcpus: u64,
     pub is_resume: bool,
     // pub kvm: Kvm
-    
 }
 
 // The `VmmExitHandler` is used as the mechanism for exiting from the event manager loop.
@@ -278,7 +274,7 @@ struct VmmExitHandler {
 //         // .map_err(Error::)
 // }
 
-fn get_memory_state(size: usize) -> GuestMemoryState{
+fn get_memory_state(size: usize) -> GuestMemoryState {
     let region_state = GuestMemoryRegionState {
         base_address: 0,
         size: size,
@@ -286,7 +282,7 @@ fn get_memory_state(size: usize) -> GuestMemoryState{
     };
 
     GuestMemoryState {
-        regions: vec![region_state]
+        regions: vec![region_state],
     }
 }
 
@@ -340,15 +336,6 @@ impl MutEventSubscriber for VmmExitHandler {
     }
 }
 
-
-fn create_file(name: &str, mem_size: usize) {
-
-    // TODO: Do it with create
-    let mut f = File::create(name).unwrap();
-    f.set_len(mem_size as u64);
-}
-
-
 impl TryFrom<VMMConfig> for Vmm {
     type Error = Error;
 
@@ -362,8 +349,6 @@ impl TryFrom<VMMConfig> for Vmm {
         }
         Vmm::check_kvm_capabilities(&kvm)?;
 
-        let mem_path = "memory.txt";
-        
         // NOTE: RPC event controller
         let rpc_controller = Arc::new(Mutex::new(RpcController::new()));
 
@@ -382,55 +367,42 @@ impl TryFrom<VMMConfig> for Vmm {
         event_manager.add_subscriber(rpc_controller.clone());
 
         // save vm
-        // let my_vmstate = vm.save_state().unwrap(); 
+        // let my_vmstate = vm.save_state().unwrap();
         // Self::save_cpu("cc.txt", &my_vmstate);
-        
+
         let guest_memory;
         let mut is_resume = false;
         let mem_size = ((config.memory_config.size_mib as u64) << 20) as usize;
-        
-        let my_vm = if config.snapshot_config.is_none() {
 
-            let mem_regions = vec![
-                (None, GuestAddress(0), mem_size)
-            ];
+        let my_vm = if config.snapshot_config.is_none() {
+            let mem_regions = vec![(None, GuestAddress(0), mem_size)];
             guest_memory = vm_memory::create_guest_memory(&mem_regions[..], true).unwrap();
-            let mut vm = KvmVm::new(
+            KvmVm::new(
                 &kvm,
                 vm_config,
                 &guest_memory,
                 wrapped_exit_handler.clone(),
-                device_mgr.clone()
-            ).unwrap();
-
-            let mut vm_state = vm.save_state_tmp().unwrap();
-            Self::save_cpu("temp_cpu.txt", &vm_state);
-            vm_state = Self::restore_cpu("temp_cpu.txt");
-            KvmVm::from_state(
-                &kvm,
-                vm_state,
-                &guest_memory,
-                wrapped_exit_handler.clone(),
                 device_mgr.clone(),
-            ).unwrap()
-        } else{
+            )
+            .unwrap()
+        } else {
             // resume
             is_resume = true;
             let memory_snapshot_path = config.snapshot_config.clone().unwrap().memory_snapshot_path;
             let cpu_snapshot_path = config.snapshot_config.unwrap().cpu_snapshot_path;
 
-            println!("restoring snapshot");
-            let vmstate= Self::restore_cpu(&cpu_snapshot_path[..]);
+            // println!("restoring snapshot");
+            let vmstate = Self::restore_cpu(&cpu_snapshot_path[..]);
             // guest_memory = GuestMemoryMmap::restore(Some(memory_file.as_file()), &memory_state, false);
 
             let memory_state = get_memory_state(mem_size);
             let file = File::options()
-                        .write(true)
-                        .read(true)
-                        .open(memory_snapshot_path)
-                        .unwrap();
+                .write(true)
+                .read(true)
+                .open(memory_snapshot_path)
+                .unwrap();
             guest_memory = GuestMemoryMmap::restore(Some(&file), &memory_state, false);
-            println!("snapshot restored");
+            // println!("snapshot restored");
 
             KvmVm::from_state(
                 &kvm,
@@ -438,9 +410,9 @@ impl TryFrom<VMMConfig> for Vmm {
                 &guest_memory,
                 wrapped_exit_handler.clone(),
                 device_mgr.clone(),
-            ).unwrap()
+            )
+            .unwrap()
         };
-
 
         let mut vmm = Vmm {
             vm: my_vm,
@@ -458,7 +430,7 @@ impl TryFrom<VMMConfig> for Vmm {
             // kvm: kvm
         };
 
-        println!("vcpu state: {:?}", vmm.vm.vcpus[0].run_state.vm_state.lock().unwrap());
+        // println!("vcpu state: {:?}", vmm.vm.vcpus[0].run_state.vm_state.lock().unwrap());
 
         // INFERENCE: snapshot restored after add_serial_console won't work
         vmm.add_serial_console()?;
@@ -476,52 +448,56 @@ impl TryFrom<VMMConfig> for Vmm {
             vmm.add_net_device(cfg)?;
         }
 
-
         // vmm.emulate_serial_init();
         Ok(vmm)
     }
-    
 }
 
 impl Vmm {
-        /// Sets RDA bit in serial console
-        pub fn emulate_serial_init(&self) -> Result<()> {
-            #[cfg(target_arch = "x86_64")]
-            let mut serial = self
-                .device_mgr  // replacement for pio device manager
-//                .stdio_serial
-                .lock()
-                .expect("Poisoned lock");
-    
-            // When restoring from a previously saved state, there is no serial
-            // driver initialization, therefore the RDA (Received Data Available)
-            // interrupt is not enabled. Because of that, the driver won't get
-            // notified of any bytes that we send to the guest. The clean solution
-            // would be to save the whole serial device state when we do the vm
-            // serialization. For now we set that bit manually
-            serial
-                // .serial
-                .pio_write(PioAddress(IER_RDA_OFFSET), &[IER_RDA_BIT]).unwrap();
-                // .map_err(|_| Error::Serial(std::io::Error::last_os_error()))?;
-            Ok(())
-        }
+    /// Sets RDA bit in serial console
+    pub fn emulate_serial_init(&self) -> Result<()> {
+        #[cfg(target_arch = "x86_64")]
+        let serial = self
+            .device_mgr // replacement for pio device manager
+            //                .stdio_serial
+            .lock()
+            .expect("Poisoned lock");
+
+        // When restoring from a previously saved state, there is no serial
+        // driver initialization, therefore the RDA (Received Data Available)
+        // interrupt is not enabled. Because of that, the driver won't get
+        // notified of any bytes that we send to the guest. The clean solution
+        // would be to save the whole serial device state when we do the vm
+        // serialization. For now we set that bit manually
+        serial
+            // .serial
+            .pio_write(PioAddress(IER_RDA_OFFSET), &[IER_RDA_BIT])
+            .unwrap();
+        // .map_err(|_| Error::Serial(std::io::Error::last_os_error()))?;
+        Ok(())
+    }
     ///
-    pub fn save_snapshot(&mut self, cpu_snapshot_path: String, memory_snapshot_path: String,  resume: bool){
-        if resume{
-            // self.vm.snapshot_and_resume(cpu_snapshot_path, memory_snapshot_path);   
-            self.snapshot_and_resume(&cpu_snapshot_path[..], &memory_snapshot_path[..]);   
-        }
-        else {
+    pub fn save_snapshot(
+        &mut self,
+        cpu_snapshot_path: String,
+        memory_snapshot_path: String,
+        resume: bool,
+    ) {
+        if resume {
+            // self.vm.snapshot_and_resume(cpu_snapshot_path, memory_snapshot_path);
+            self.snapshot_and_resume(&cpu_snapshot_path[..], &memory_snapshot_path[..]);
+        } else {
             // self.vm.snapshot_and_pause(cpu_snapshot_path, memory_snapshot_path);
             self.snapshot_and_pause(&cpu_snapshot_path[..], &memory_snapshot_path[..]);
         }
     }
-    
+
     pub fn snapshot_and_resume(&mut self, snapshot_path: &str, memory_snapshot_path: &str) {
         // NOTE: 1. Kicking all the vcpus out of their run loop in suspending state
-        println!("Inside snapshot_and_resume");
-        self.vm.vcpu_run_state.set_and_notify(VmRunState::Suspending);
-        for handle in self.vm.vcpu_handles.iter(){
+        self.vm
+            .vcpu_run_state
+            .set_and_notify(VmRunState::Suspending);
+        for handle in self.vm.vcpu_handles.iter() {
             let _ = handle.kill(SIGRTMIN() + 0);
         }
 
@@ -530,49 +506,31 @@ impl Vmm {
             r.recv().unwrap();
             println!("Received message from {i}th cpu");
         }
-    
-        // FIXME: 2. Saving the vcpu state for all vcpus once all have came out -> Do it in VMM
-        // let vcpu_state = self.vm.save_state().unwrap();
 
-        // FIXME: 3. Serialize memory and vcpus -> Save to disk in supplied file name
         let vm_state = self.vm.save_state().unwrap();
-        Self::take_snapshot(snapshot_path, memory_snapshot_path, &vm_state, &self.guest_memory);
-        // mut self.save_snapshot_helper(&cpu_snapshot_path).unwrap();
-        // Self::save_snapshot_helper(&snapshot_path[..], &memory_snapshot_path[..]).unwrap();
-        // FIXME: issue here is to get mutable reference to self.
-        println!("Setting and notifying");
-
-        // println!("saving cpu");
-        // Self::save_cpu("temp_cpu.txt", &vm_state);
-        // println!("restoring cpu");
-        // let vm_state = Self::restore_cpu("temp_cpu.txt");
-        // self.vm = KvmVm::from_state(
-        //     &Kvm::new().map_err(Error::KvmIoctl).unwrap(),
-        //     vm_state,
-        //     &self.guest_memory,
-        //     self.exit_handler.clone(),
-        //     self.device_mgr.clone()
-        // ).unwrap();
+        Self::take_snapshot(
+            snapshot_path,
+            memory_snapshot_path,
+            &vm_state,
+            &self.guest_memory,
+        );
 
         // NOTE: 4. Set and notify all vcpus to Running state so that they breaks out of their wait loop and resumes
-        self.vm.vcpu_run_state.set_and_notify(VmRunState::Running);        
+        self.vm.vcpu_run_state.set_and_notify(VmRunState::Running);
         // self.vm.run(Some(GuestAddress(0)), true).unwrap();
-
     }
 
     pub fn snapshot_and_pause(&mut self, snapshot_path: &str, memory_snapshot_path: &str) {
-        
         // NOTE: 1. Kicking all the vcpus out of their run loop in suspending state
         self.vm.vcpu_run_state.set_and_notify(VmRunState::Exiting);
-        for handle in self.vm.vcpu_handles.iter(){
+        for handle in self.vm.vcpu_handles.iter() {
             let _ = handle.kill(SIGRTMIN() + 0);
         }
 
         for i in 0..self.vm.config.num_vcpus {
             let r = self.vm.vcpu_rx.as_ref().unwrap();
             match r.recv() {
-                Ok(_) => {
-                },
+                Ok(_) => {}
                 Err(e) => {
                     println!("Error:{:?}", e);
                 }
@@ -581,21 +539,25 @@ impl Vmm {
         }
 
         let vm_state = self.vm.save_state().unwrap();
-        Self::take_snapshot(snapshot_path, memory_snapshot_path, &vm_state, &self.guest_memory);
-        // FIXME: 2. Saving the vcpu state for all vcpus once all have came out -> Do it in VMM
-        // let vcpu_state = self.vm.save_state().unwrap();
-        // self.save_snapshot_helper(&snapshot_path[..], &memory_snapshot_path[..]).unwrap();
-        
-        // FIXME: 3. Serialize memory and vcpus -> Save to disk in supplied file name
+        Self::take_snapshot(
+            snapshot_path,
+            memory_snapshot_path,
+            &vm_state,
+            &self.guest_memory,
+        );
 
         // Now, make the vmm exit out of run loop
         let _ = self.vm.exit_handler.kick();
-        
     }
 
-    pub fn take_snapshot(snapshot_path: &str, memory_path: &str, vm_state: &VmState, guest_memory: &GuestMemoryMmap) {
+    pub fn take_snapshot(
+        snapshot_path: &str,
+        memory_path: &str,
+        vm_state: &VmState,
+        guest_memory: &GuestMemoryMmap,
+    ) {
         Self::save_cpu(snapshot_path, vm_state);
-        
+
         // std::fs::copy("memory.txt", memory_path);
         let mut writer = File::options()
             .read(true)
@@ -609,82 +571,27 @@ impl Vmm {
     }
 
     ///
-    pub fn save_cpu( snapshot_path: &str, vm_state: &VmState)  {
-
+    pub fn save_cpu(snapshot_path: &str, vm_state: &VmState) {
         let mut snapshot_file = File::create(snapshot_path).unwrap();
-        // let vm_state = self.vm.save_state().unwrap();
-
-        println!("cpu rip before saving: {}", vm_state.vcpus_state[0].regs.rip);
-        // println!("vcpus len before saving: {:?}",self.vm.vcpus.len());
-        println!("vcpustate len before saving : {:?}", vm_state.vcpus_state.len());
-
-        // let bytes = unsafe { std::mem::transmute::<VmState, [u8; std::mem::size_of::<VmState>()]>(vm_state) };
-        // snapshot_file.write_all(&bytes).unwrap();
-        // let state_size = mem::size_of::<VmState>();
-
         let mut mem = Vec::new();
-        let mut version_map = VersionMap::new();
-        // version_map
-        //     .new_version() 
-        //     .set_type_version(VmState::type_id(), 1) 
-        //     .new_version() 
-        //     .set_type_version(VmState::type_id(), 1); 
-
-
-        vm_state
-            .serialize(&mut mem, &version_map, 1)
-            .unwrap();
-
-        // println!("mem len: {} mem: {:?}\n\n\n\n", mem.len(), mem);
-
-        // serde_json::to_writer(&mut snapshot_file, &mem).unwrap();
-        snapshot_file.write_all(&mem).unwrap(); 
-
-        // println!("state saved");
-
-        // let mut snapshot_file = File::open(snapshot_path).unwrap();
-        // let mut bytes = Vec::new();
-        // snapshot_file.read(&mut bytes).unwrap();
-        // snapshot_file.read_to_end(&mut bytes).unwrap();
-        // // println!("bytes len: {} bytes: {:?}", bytes.len(), bytes);
-        // let vm_state = VmState::deserialize(&mut bytes.as_slice(), &version_map, 1).unwrap();
-        // println!("vcpustate len after saving : {:?}", vm_state.vcpus_state.len());
-
-
+        let version_map = VersionMap::new();
+        vm_state.serialize(&mut mem, &version_map, 1).unwrap();
+        snapshot_file.write_all(&mem).unwrap();
     }
-    
-    /// restore cpu
-    pub fn restore_cpu(snapshot_path: &str) -> VmState{
 
+    /// restore cpu
+    pub fn restore_cpu(snapshot_path: &str) -> VmState {
         let mut snapshot_file = File::open(snapshot_path).unwrap();
-        let mut version_map = VersionMap::new();
+        let version_map = VersionMap::new();
         let mut bytes = Vec::new();
 
         snapshot_file.read_to_end(&mut bytes).unwrap();
-        let mut vm_state = VmState::deserialize(&mut bytes.as_slice(), &version_map, 1).unwrap();
-        println!("cpu rip after read: {}", vm_state.vcpus_state[0].regs.rip);
-        // use kvm_bindings::kvm_regs;
-        // let regs = kvm_regs { rax: 18446744071583216976, rbx: 18446612682324879616, rcx: 0, rdx: 1018, rsi: 2, rdi: 18446744071599936736, rsp: 18446683600570039976, rbp: 18446683600570040000, r8: 176, r9: 0, r10: 0, r11: 0, r12: 18446744071599936736, r13: 0, r14: 18446744071599937240, r15: 0, rip: 18446744071583216990, rflags: 6 };
-
-        vm_state
+        VmState::deserialize(&mut bytes.as_slice(), &version_map, 1).unwrap()
     }
-
-
-    // /// save vm
-    // pub fn save_snapshot_helper(vm_state: &VmState, snapshot_path: &str, memory_snapshot_path: &str) -> Result<()> {
-    //     println!("FLOW: Saving snapshot");
-    //     Self::save_cpu(snapshot_path, vm_state );
-    //     println!("outside save cpu");
-    //     std::fs::copy("memory.txt", memory_snapshot_path).unwrap();
-    //     println!("FLOW: Snapshot saved");
-    //     Ok(())
-    // }
-
 
     /// Run the VMM.
     pub fn run(&mut self) -> Result<()> {
-
-        let kernel_load_addr ;
+        let kernel_load_addr;
         if !self.is_resume {
             let load_result = self.load_kernel()?;
             kernel_load_addr = self.compute_kernel_load_addr(&load_result)?;
@@ -692,48 +599,15 @@ impl Vmm {
             if stdin().lock().set_raw_mode().is_err() {
                 eprintln!("Failed to set raw mode on terminal. Stdin will echo.");
             }
-        }
-        else{
+        } else {
             kernel_load_addr = GuestAddress(0);
         }
-        // TRASH. DOES NOT DO ANYTHING
-        // save and restore memory here
-        // Self::take_snapshot("tmp_cpu.txt", "tmp_memory.txt", &self.vm.save_state().unwrap(), &self.guest_memory);
-        // let vm_state = Self::restore_cpu("tmp_cpu.txt");
-        // println!("restoring snapshot before vm.run");
-        // let mem_size = ((256 as u64) << 20) as usize; //TODO: hardcoded
-        // let memory_state = get_memory_state(mem_size);
-        // let file = File::options()
-        //                 .write(true)
-        //                 .read(true)
-        //                 .open("mem.txt")
-        //                 .unwrap();
-        // let mem_regions = vec![
-        //                 (None, GuestAddress(0), mem_size)
-        //             ];
-        // let guest_memory = vm_memory::create_guest_memory(&mem_regions[..], true).unwrap();
-            
-        // // let guest_memory = GuestMemoryMmap::restore(Some(&file), &memory_state, false);
-        // self.guest_memory= guest_memory ;
-        // // self.vm = KvmVm::from_state(self, vmstate, &guest_memory,self.exit_handler, self.device_mgr).unwrap();
-        // println!("restored snapshot before vm.run");
 
-        // println!("saving cpu");
-        // let vm_state = self.vm.save_state_tmp().unwrap();
-        // Self::save_cpu("temp_cpu.txt", &vm_state);
-        // println!("restoring cpu");
-        // let vm_state = Self::restore_cpu("temp_cpu.txt");
-        // self.vm = KvmVm::from_state(
-        //     &self.kvm,
-        //     vm_state,
-        //     &self.guest_memory,
-        //     self.exit_handler.clone(),
-        //     self.device_mgr.clone()
-        // ).unwrap();
+        // println!("FLOW: Starting VM");
+        self.vm
+            .run(Some(kernel_load_addr), self.is_resume)
+            .map_err(Error::Vm)?;
 
-        println!("FLOW: Starting VM");        
-        self.vm.run(Some(kernel_load_addr), self.is_resume).map_err(Error::Vm)?;
-        
         loop {
             match self.event_mgr.run() {
                 Ok(_) => (),
@@ -748,7 +622,7 @@ impl Vmm {
                 "PAUSE" => {
                     self.save_snapshot(cpu_snapshot_path, memory_snapshot_path, false);
                     rpc_controller.pause_or_resume.store(0, Ordering::Relaxed);
-                },
+                }
                 "RESUME" => {
                     self.save_snapshot(cpu_snapshot_path, memory_snapshot_path, true);
                     rpc_controller.pause_or_resume.store(0, Ordering::Relaxed);
@@ -765,44 +639,6 @@ impl Vmm {
         self.vm.shutdown();
 
         Ok(())
-    }
-
-
-    // // Create guest memory regions.
-    // fn create_guest_memory(memory_config: &MemoryConfig) -> Result<GuestMemoryMmap> {
-    //     let mem_size = ((memory_config.size_mib as u64) << 20) as usize;
-    //     let mem_regions = Vmm::create_memory_regions(mem_size);
-
-    //     // Create guest memory from regions.
-    //     GuestMemoryMmap::from_ranges(&mem_regions)
-    //         .map_err(|e| Error::Memory(MemoryError::VmMemory(e)))
-    // }
-
-    // fn create_memory_regions(mem_size: usize) -> Vec<(GuestAddress, usize)> {
-    //     #[cfg(target_arch = "x86_64")]
-    //     // On x86_64, they surround the MMIO gap (dedicated space for MMIO device slots) if the
-    //     // configured memory size exceeds the latter's starting address.
-    //     match mem_size.checked_sub(MMIO_GAP_START as usize) {
-    //         // Guest memory fits before the MMIO gap.
-    //         None | Some(0) => vec![(GuestAddress(0), mem_size)],
-    //         // Guest memory extends beyond the MMIO gap.
-    //         Some(remaining) => vec![
-    //             (GuestAddress(0), MMIO_GAP_START as usize),
-    //             (GuestAddress(MMIO_GAP_END), remaining),
-    //         ],
-    //     }
-
-    //     #[cfg(target_arch = "aarch64")]
-    //     vec![(GuestAddress(AARCH64_PHYS_MEM_START), mem_size)]
-    // }
-
-    fn get_file_offset(name: &str) ->  Result<FileOffset> {
-        let f = File::options()
-        .read(true)
-        .write(true)
-        .open(name)
-        .unwrap();
-        Ok(FileOffset::new(f,0))
     }
 
     // Load the kernel into guest memory.

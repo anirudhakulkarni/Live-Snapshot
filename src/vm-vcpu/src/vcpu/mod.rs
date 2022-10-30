@@ -5,13 +5,12 @@
 use libc::siginfo_t;
 use std::cell::RefCell;
 use std::ffi::c_void;
-use std::io::{self, stdin, Write};
+use std::io::{self, stdin};
 use std::os::raw::c_int;
 use std::result;
 use std::sync::{Arc, Barrier, Condvar, Mutex, mpsc};
 use versionize::{VersionMap, Versionize, VersionizeResult};
 use versionize_derive::Versionize;
-use std::fs::OpenOptions;
 
 #[cfg(target_arch = "x86_64")]
 use kvm_bindings::{
@@ -334,34 +333,7 @@ pub struct KvmVcpu {
 impl KvmVcpu {
     thread_local!(static TLS_VCPU_PTR: RefCell<Option<*const KvmVcpu>> = RefCell::new(None));
     pub fn write_state(&self) {
-        // let mut file = OpenOptions::new()
-        //     .write(true)
-        //     .create(true)
-        //     .open("suspend.txt")
-        //     .unwrap();
-        // // write vcpu state to file
-        // let mut mem = Vec::new();
-        // let vcpu_state = self.save_state().unwrap();
-
-        // let mut version_map = VersionMap::new();
-        // vcpu_state
-        //     .serialize(&mut mem, &version_map, 1)
-        //     .unwrap();
-        println!("saving vcpu");
         *(self.vcpu_state.lock().unwrap()) = Some(self.save_state().unwrap());
-        // println!("cpu rip after suspend: {}",vcpu_state.regs.rip);
-        println!("regs: \n{:?}", self.vcpu_fd.get_regs().unwrap());
-        println!("val: {:?}", self.vcpu_state.lock().unwrap().clone().unwrap().regs);
-    
-        // println!("============[STATE]===============");
-        // let cpu_state = self.save_state().unwrap();
-    
-        // println!("lapic :{:?}", cpu_state.lapic);
-        // println!("mp_state :{:?}", cpu_state.mp_state);
-        // println!("regs :{:?}", cpu_state.regs);
-    
-    
-        // file.write_all(&mem).unwrap();
     }
     
     
@@ -713,24 +685,7 @@ impl KvmVcpu {
         self.device_mgr
         .lock()
         .unwrap()
-        .pio_write(PioAddress(IER_RDA_OFFSET), &[IER_RDA_BIT]);
-
-//         let mut serial = self
-//             .device_mgr  // replacement for pio device manager
-// //                .stdio_serial
-//             .lock()
-//             .expect("Poisoned lock");
-
-//         // When restoring from a previously saved state, there is no serial
-//         // driver initialization, therefore the RDA (Received Data Available)
-//         // interrupt is not enabled. Because of that, the driver won't get
-//         // notified of any bytes that we send to the guest. The clean solution
-//         // would be to save the whole serial device state when we do the vm
-//         // serialization. For now we set that bit manually
-//         serial
-//             // .serial
-//             .pio_write(PioAddress(IER_RDA_OFFSET), &[IER_RDA_BIT]).unwrap();
-//             // .map_err(|_| Error::Serial(std::io::Error::last_os_error()))?;
+        .pio_write(PioAddress(IER_RDA_OFFSET), &[IER_RDA_BIT]).unwrap();
         Ok(())
     }
 
@@ -757,16 +712,13 @@ impl KvmVcpu {
                 }
             }
         }
-        if is_resume{
-            self.emulate_serial_init()?;
+        else{
+            // self.emulate_serial_init()?;
         }
         self.init_tls()?;
 
         self.run_barrier.wait();
 
-        // let mut counter = 0;
-
-        println!("Going into cpu run");
         'vcpu_run: loop {
             let mut interrupted_by_signal = false;
             match self.vcpu_fd.run() {
@@ -782,14 +734,7 @@ impl KvmVcpu {
                             break;
                         }
                         VcpuExit::IoOut(addr, data) => {
-                            
-                            // counter += 1;
-                            // if(counter%1000 == 0){println!("\n======counter={}========",counter);}
-                            // if(counter == 15000){
-                            //     println!("saving vcpu");
-                            //     self.write_state();
-                            // }
-
+                        
                             if (0x3f8..(0x3f8 + 8)).contains(&addr) {
                                 // Write at the serial port.
                                 if self
@@ -911,23 +856,13 @@ impl KvmVcpu {
                         VmRunState::Suspending => {
                             // The VM is suspending. We run this loop until we get a different
                             // state.
-                            println!("Suspending the threads");
                             self.write_state();
                             self.tx.send(self.config.id.into()).unwrap();
-                            // self.write_state();
-
-                            // INFERENCE::
-                            // If write_state is done before tx.send then stuck else shutdown
-                            // If with write_state above tx.send, we save state with resume = false then ^C doesn't work but
-                            // with resume = true it does
                         }
                         VmRunState::Exiting => {
                             // The VM is exiting. We also exit from this VCPU thread.
-                            // self.write_state();
-                            println!("Exiting the threads");
                             self.write_state();
                             self.tx.send(self.config.id.into()).unwrap();
-                            // self.write_state();
                             break 'vcpu_run;
                         }
                     }
