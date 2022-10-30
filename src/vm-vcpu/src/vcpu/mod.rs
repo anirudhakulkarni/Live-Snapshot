@@ -323,28 +323,32 @@ pub struct KvmVcpu {
     config: VcpuConfig,
     run_barrier: Arc<Barrier>,
     pub run_state: Arc<VcpuRunState>,
-    tx: mpsc::Sender<i32>
+    tx: mpsc::Sender<i32>,
+    pub vcpu_state: Arc<Mutex<Option<VcpuState>>>,
 }
 
 
 impl KvmVcpu {
     thread_local!(static TLS_VCPU_PTR: RefCell<Option<*const KvmVcpu>> = RefCell::new(None));
     pub fn write_state(&self) {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .open("suspend.txt")
-            .unwrap();
-        // write vcpu state to file
-        let mut mem = Vec::new();
-        let vcpu_state = self.save_state().unwrap();
+        // let mut file = OpenOptions::new()
+        //     .write(true)
+        //     .create(true)
+        //     .open("suspend.txt")
+        //     .unwrap();
+        // // write vcpu state to file
+        // let mut mem = Vec::new();
+        // let vcpu_state = self.save_state().unwrap();
 
-        let mut version_map = VersionMap::new();
-        vcpu_state
-            .serialize(&mut mem, &version_map, 1)
-            .unwrap();
+        // let mut version_map = VersionMap::new();
+        // vcpu_state
+        //     .serialize(&mut mem, &version_map, 1)
+        //     .unwrap();
+        println!("saving vcpu");
+        *(self.vcpu_state.lock().unwrap()) = Some(self.save_state().unwrap());
         // println!("cpu rip after suspend: {}",vcpu_state.regs.rip);
-        // println!("regs: \n{:?}", self.vcpu_fd.get_regs().unwrap());
+        println!("regs: \n{:?}", self.vcpu_fd.get_regs().unwrap());
+        println!("val: {:?}", self.vcpu_state.lock().unwrap().clone().unwrap().regs);
     
         // println!("============[STATE]===============");
         // let cpu_state = self.save_state().unwrap();
@@ -354,7 +358,7 @@ impl KvmVcpu {
         // println!("regs :{:?}", cpu_state.regs);
     
     
-        file.write_all(&mem).unwrap();
+        // file.write_all(&mem).unwrap();
     }
     
     
@@ -381,7 +385,8 @@ impl KvmVcpu {
             config,
             run_barrier,
             run_state,
-            tx
+            tx,
+            vcpu_state: Arc::new(Mutex::new(None))
         };
 
         #[cfg(target_arch = "x86_64")]
@@ -472,7 +477,8 @@ impl KvmVcpu {
             config: state.config.clone(),
             run_barrier,
             run_state,
-            tx
+            tx,
+            vcpu_state: Arc::new(Mutex::new(None))
         };
 
         #[cfg(target_arch = "aarch64")]
@@ -875,9 +881,9 @@ impl KvmVcpu {
                             // The VM is suspending. We run this loop until we get a different
                             // state.
                             println!("Suspending the threads");
-                            // self.write_state();
-                            self.tx.send(self.config.id.into()).unwrap();
                             self.write_state();
+                            self.tx.send(self.config.id.into()).unwrap();
+                            // self.write_state();
 
                             // INFERENCE::
                             // If write_state is done before tx.send then stuck else shutdown
@@ -888,9 +894,9 @@ impl KvmVcpu {
                             // The VM is exiting. We also exit from this VCPU thread.
                             // self.write_state();
                             println!("Exiting the threads");
-                            // self.write_state();
-                            self.tx.send(self.config.id.into()).unwrap();
                             self.write_state();
+                            self.tx.send(self.config.id.into()).unwrap();
+                            // self.write_state();
                             break 'vcpu_run;
                         }
                     }
