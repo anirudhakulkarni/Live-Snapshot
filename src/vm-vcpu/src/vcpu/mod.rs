@@ -44,6 +44,9 @@ use vmm_sys_util::signal::{register_signal_handler, SIGRTMIN};
 use vmm_sys_util::terminal::Terminal;
 
 use utils::debug;
+pub const IER_RDA_BIT: u8 = 0b0000_0001;
+// Received Data Available interrupt offset
+pub const IER_RDA_OFFSET: u16 = 1;
 
 #[cfg(target_arch = "aarch64")]
 #[macro_use]
@@ -699,6 +702,31 @@ impl KvmVcpu {
             }
         });
     }
+    pub fn emulate_serial_init(&self) -> Result<()> {
+        #[cfg(target_arch = "x86_64")]
+        self.device_mgr
+        .lock()
+        .unwrap()
+        .pio_write(PioAddress(IER_RDA_OFFSET), &[IER_RDA_BIT]);
+
+//         let mut serial = self
+//             .device_mgr  // replacement for pio device manager
+// //                .stdio_serial
+//             .lock()
+//             .expect("Poisoned lock");
+
+//         // When restoring from a previously saved state, there is no serial
+//         // driver initialization, therefore the RDA (Received Data Available)
+//         // interrupt is not enabled. Because of that, the driver won't get
+//         // notified of any bytes that we send to the guest. The clean solution
+//         // would be to save the whole serial device state when we do the vm
+//         // serialization. For now we set that bit manually
+//         serial
+//             // .serial
+//             .pio_write(PioAddress(IER_RDA_OFFSET), &[IER_RDA_BIT]).unwrap();
+//             // .map_err(|_| Error::Serial(std::io::Error::last_os_error()))?;
+        Ok(())
+    }
 
     /// vCPU emulation loop.
     ///
@@ -722,6 +750,9 @@ impl KvmVcpu {
                         .map_err(Error::VcpuSetReg)?;
                 }
             }
+        }
+        if is_resume{
+            self.emulate_serial_init()?;
         }
         self.init_tls()?;
 
@@ -875,9 +906,9 @@ impl KvmVcpu {
                             // The VM is suspending. We run this loop until we get a different
                             // state.
                             println!("Suspending the threads");
-                            // self.write_state();
-                            self.tx.send(self.config.id.into()).unwrap();
                             self.write_state();
+                            self.tx.send(self.config.id.into()).unwrap();
+                            // self.write_state();
 
                             // INFERENCE::
                             // If write_state is done before tx.send then stuck else shutdown

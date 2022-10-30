@@ -18,6 +18,13 @@ use vmm_sys_util::epoll::EventSet;
 
 use utils::debug;
 
+
+// Received Data Available interrupt - for letting the driver know that
+// there is some pending data to be processed.
+pub const IER_RDA_BIT: u8 = 0b0000_0001;
+// Received Data Available interrupt offset
+pub const IER_RDA_OFFSET: u8 = 1;
+
 /// Newtype for implementing `event-manager` functionalities.
 pub struct SerialWrapper<T: Trigger, EV: SerialEvents, W: Write>(pub Serial<T, EV, W>);
 

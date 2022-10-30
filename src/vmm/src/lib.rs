@@ -27,7 +27,7 @@ use linux_loader::configurator::{
 };
 #[cfg(target_arch = "x86_64")]
 use linux_loader::{bootparam::boot_params, cmdline::Cmdline};
-
+// use serial::{IER_RDA_OFFSET,IER_RDA_OFFSET};
 use linux_loader::loader::{self, KernelLoader, KernelLoaderResult};
 #[cfg(target_arch = "x86_64")]
 use linux_loader::loader::{
@@ -97,6 +97,11 @@ const ZEROPG_START: u64 = 0x7000;
 /// Address where the kernel command line is written.
 #[cfg(target_arch = "x86_64")]
 const CMDLINE_START: u64 = 0x0002_0000;
+// there is some pending data to be processed.
+
+pub const IER_RDA_BIT: u8 = 0b0000_0001;
+// Received Data Available interrupt offset
+pub const IER_RDA_OFFSET: u16 = 1;
 
 /// Default high memory start (1 MiB).
 #[cfg(target_arch = "x86_64")]
@@ -472,12 +477,34 @@ impl TryFrom<VMMConfig> for Vmm {
         }
 
 
+        // vmm.emulate_serial_init();
         Ok(vmm)
     }
     
 }
 
 impl Vmm {
+        /// Sets RDA bit in serial console
+        pub fn emulate_serial_init(&self) -> Result<()> {
+            #[cfg(target_arch = "x86_64")]
+            let mut serial = self
+                .device_mgr  // replacement for pio device manager
+//                .stdio_serial
+                .lock()
+                .expect("Poisoned lock");
+    
+            // When restoring from a previously saved state, there is no serial
+            // driver initialization, therefore the RDA (Received Data Available)
+            // interrupt is not enabled. Because of that, the driver won't get
+            // notified of any bytes that we send to the guest. The clean solution
+            // would be to save the whole serial device state when we do the vm
+            // serialization. For now we set that bit manually
+            serial
+                // .serial
+                .pio_write(PioAddress(IER_RDA_OFFSET), &[IER_RDA_BIT]).unwrap();
+                // .map_err(|_| Error::Serial(std::io::Error::last_os_error()))?;
+            Ok(())
+        }
     ///
     pub fn save_snapshot(&mut self, cpu_snapshot_path: String, memory_snapshot_path: String,  resume: bool){
         if resume{
