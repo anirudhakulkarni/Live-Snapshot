@@ -112,7 +112,7 @@ pub struct VcpuConfig {
 
 impl Default for VcpuConfig {
     fn default() -> Self {
-        VcpuConfig { num: 1u8 }
+        VcpuConfig { num: 1u8}
     }
 }
 
@@ -126,22 +126,12 @@ impl TryFrom<&str> for VcpuConfig {
             .value_of("num")
             .map_err(ConversionError::new_vcpus)?
             .unwrap_or_else(|| num::NonZeroU8::new(1).unwrap());
+        
         arg_parser
             .all_consumed()
             .map_err(ConversionError::new_vcpus)?;
-        Ok(VcpuConfig { num: num.into() })
+        Ok(VcpuConfig { num: num.into(),})
     }
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct SnapshotConfig {
-    pub cpu_snapshot_path: String,
-    pub memory_snapshot_path: String,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct RpcConfig {
-    pub port: u16,
 }
 
 /// Guest kernel configurations.
@@ -153,6 +143,8 @@ pub struct KernelConfig {
     pub path: PathBuf,
     /// Address where the kernel is loaded.
     pub load_addr: u64,
+    /// starter script path
+    pub starter_path: String,
 }
 
 impl KernelConfig {
@@ -174,6 +166,7 @@ impl Default for KernelConfig {
             cmdline: KernelConfig::default_cmdline(),
             path: PathBuf::from(""), // FIXME: make it a const.
             load_addr: DEFAULT_KERNEL_LOAD_ADDR,
+            starter_path: String::from(""),
         }
     }
 }
@@ -206,6 +199,11 @@ impl TryFrom<&str> for KernelConfig {
             .value_of("kernel_load_addr")
             .map_err(ConversionError::new_kernel)?
             .unwrap_or(DEFAULT_KERNEL_LOAD_ADDR);
+        
+        let starter_path = arg_parser
+            .value_of("starter_file")
+            .map_err(ConversionError::new_kernel)?
+            .unwrap_or_else(|| "".to_string());
 
         arg_parser
             .all_consumed()
@@ -214,6 +212,7 @@ impl TryFrom<&str> for KernelConfig {
             cmdline,
             path,
             load_addr,
+            starter_path,
         })
     }
 }
@@ -282,10 +281,6 @@ pub struct VMMConfig {
     pub net_config: Option<NetConfig>,
     /// Block device configuration.
     pub block_config: Option<BlockConfig>,
-    /// Snapshot configuration
-    pub snapshot_config: Option<SnapshotConfig>,
-    /// RPC configuration
-    pub rpc_config: Option<RpcConfig>
 }
 
 #[cfg(test)]
