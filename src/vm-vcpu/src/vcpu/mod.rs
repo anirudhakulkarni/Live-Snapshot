@@ -5,8 +5,10 @@
 use libc::siginfo_t;
 use std::cell::RefCell;
 use std::ffi::c_void;
-use std::io::{self, stdin};
+use std::fs::File;
+use std::io::{self, stdin, Write};
 use std::os::raw::c_int;
+use std::time::Instant;
 use std::{result, fs};
 use std::sync::{Arc, Barrier, Condvar, Mutex, mpsc};
 use versionize::{VersionMap, Versionize, VersionizeResult};
@@ -698,7 +700,7 @@ impl KvmVcpu {
     /// * `instruction_pointer`: Represents the start address of the vcpu. This can be None
     /// when the IP is specified using the platform dependent registers.
     #[allow(clippy::if_same_then_else)]
-    pub fn run(&mut self, instruction_pointer: Option<GuestAddress>, is_resume: bool) -> Result<()> {
+    pub fn run(&mut self, instruction_pointer: Option<GuestAddress>, is_resume: bool, instant: Arc<Mutex<Instant>>) -> Result<()> {
 
         if !is_resume {
             if let Some(ip) = instruction_pointer {
@@ -746,11 +748,29 @@ impl KvmVcpu {
         let mut s1 = false;
         let mut s2 = false;
         let mut done = false;
+        let mut started: bool = false;
         let mut space = 0;
         let mut cmd_idx = 0;
         let mut l = 0;
+
+        let mut file = File::options()
+                    .append(true)
+                    .create(true)
+                    .open("restore.txt")
+                    .unwrap();
+
+
         'vcpu_run: loop {
             let mut interrupted_by_signal = false;
+
+            if is_resume && !started {
+                let log = instant.lock().unwrap().elapsed();
+                file.write_all(format!("{:?}\n", log).as_bytes()).expect("Unable to write data");
+                *self.run_state.vm_state.lock().unwrap() = VmRunState::Exiting;
+                interrupted_by_signal = true;
+                started = true;
+            }
+
             match self.vcpu_fd.run() {
                 Ok(exit_reason) => {
                     // println!("{:#?}", exit_reason);
@@ -848,6 +868,13 @@ impl KvmVcpu {
                                         cmd_idx += 1;
                                     }
                                     else if idx < 2{
+                                        // if !is_resume && !started {
+                                        //     let log = instant.lock().unwrap().elapsed();
+                                        //     file.write_all(format!("{:?}\n", log).as_bytes()).expect("Unable to write data");
+                                        //     *self.run_state.vm_state.lock().unwrap() = VmRunState::Exiting;
+                                        //     interrupted_by_signal = true;
+                                        // }
+                                        started = true;
                                         data[0] = start[idx];
                                     }
                                     else{

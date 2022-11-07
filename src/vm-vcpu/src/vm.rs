@@ -6,6 +6,7 @@ use std::io::{self, ErrorKind};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Barrier, Mutex};
 use std::thread::{self, JoinHandle};
+use std::time::Instant;
 
 use versionize::{VersionMap, Versionize, VersionizeResult};
 use versionize_derive::Versionize;
@@ -481,7 +482,7 @@ impl<EH: 'static + ExitHandler + Send> KvmVm<EH> {
     ///
     /// * `vcpu_run_addr`: address in guest memory where the vcpu run starts. This can be None
     ///  when the IP is specified using the platform dependent registers.
-    pub fn run(&mut self, vcpu_run_addr: Option<GuestAddress>, is_resume: bool) -> Result<()> {
+    pub fn run(&mut self, vcpu_run_addr: Option<GuestAddress>, is_resume: bool, instant: Arc<Mutex<Instant>>) -> Result<()> {
         if self.vcpus.len() != self.config.num_vcpus as usize {
             return Err(Error::RunVcpus(io::Error::from(ErrorKind::InvalidInput)));
         }
@@ -491,11 +492,12 @@ impl<EH: 'static + ExitHandler + Send> KvmVm<EH> {
         for (id, mut vcpu) in self.vcpus.drain(..).enumerate() {
             let vcpu_exit_handler = self.exit_handler.clone();
             self.vcpu_states.push(vcpu.vcpu_state.clone());
+            let instant_clone = instant.clone();
             let vcpu_handle = thread::Builder::new()
                 .name(format!("vcpu_{}", id))
                 .spawn(move || {
                     // TODO: Check the result of both vcpu run & kick.
-                    let _ = vcpu.run(vcpu_run_addr, is_resume).unwrap();
+                    let _ = vcpu.run(vcpu_run_addr, is_resume, instant_clone).unwrap();
                     let _ = vcpu_exit_handler.kick();
                     vcpu.run_state.set_and_notify(VmRunState::Exiting);
                 })

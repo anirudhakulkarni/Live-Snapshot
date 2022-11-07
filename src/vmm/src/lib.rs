@@ -64,6 +64,8 @@ use devices::virtio::{Env, MmioConfig};
 pub mod dedup;
 pub mod memory_snapshot;
 
+use std::time::Instant;
+
 use crate::memory_snapshot::{GuestMemoryRegionState, GuestMemoryState, SnapshotMemory};
 use crate::dedup::DedupManager;
 // use memory_snapshot::{GuestMemoryRegionState, GuestMemoryState};
@@ -266,6 +268,7 @@ pub struct Vmm {
     pub num_vcpus: u64,
     pub is_resume: bool,
     pub dedup_mgr: DedupManager,
+    pub instant: Arc<Mutex<Instant>>
     // pub kvm: Kvm
 }
 
@@ -386,6 +389,7 @@ impl TryFrom<VMMConfig> for Vmm {
         let guest_memory;
         let mut is_resume = false;
         let mem_size = ((config.memory_config.size_mib as u64) << 20) as usize;
+        let instant = Arc::new(Mutex::new(Instant::now()));
 
         let dedup_mgr : DedupManager = DedupManager{
             CHUNK_SIZE,
@@ -437,7 +441,6 @@ impl TryFrom<VMMConfig> for Vmm {
         };
 
         
-
         let mut vmm = Vmm {
             vm: my_vm,
             guest_memory,
@@ -451,7 +454,8 @@ impl TryFrom<VMMConfig> for Vmm {
             #[cfg(target_arch = "aarch64")]
             num_vcpus: config.vcpu_config.num as u64,
             is_resume: is_resume,
-            dedup_mgr: dedup_mgr
+            dedup_mgr: dedup_mgr,
+            instant
             // kvm: kvm
         };
 
@@ -633,7 +637,7 @@ impl Vmm {
 
         // println!("FLOW: Starting VM");
         self.vm
-            .run(Some(kernel_load_addr), self.is_resume)
+            .run(Some(kernel_load_addr), self.is_resume, self.instant.clone())
             .map_err(Error::Vm)?;
 
         loop {
@@ -648,12 +652,22 @@ impl Vmm {
             let memory_snapshot_path = rpc_controller.memory_snapshot_path.clone();
             match rpc_controller.which_event() {
                 "PAUSE" => {
+
+                    let mut file = File::options()
+                        .append(true)
+                        .create(true)
+                        .open("snapshot.txt")
+                        .unwrap();
+
+                    *self.instant.lock().unwrap() = Instant::now();
                     self.save_snapshot(cpu_snapshot_path, memory_snapshot_path, false);
                     rpc_controller.pause_or_resume.store(0, Ordering::Relaxed);
+                    file.write_all(format!("{:?}\n", self.instant.lock().unwrap().elapsed()).as_bytes()).expect("Unable to write data");
                 }
                 "RESUME" => {
+                    
                     self.save_snapshot(cpu_snapshot_path, memory_snapshot_path, true);
-                    rpc_controller.pause_or_resume.store(0, Ordering::Relaxed);
+                    rpc_controller.pause_or_resume.store(0, Ordering::Relaxed);  
                 }
                 _ => {
                     // do nothing, eat 5 star.
