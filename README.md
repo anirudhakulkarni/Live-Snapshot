@@ -45,7 +45,7 @@
 <!-- crates.io badge -->
 
 The project is built on the [vmm-refernce](https://github.com/codenet/vmm-reference) codebase that serve as a starting point in the creation of tailor-made VMMs that users build according to their needs. But it does not provide the functionality to pause and resume a VM. That is motivation for our project.
-We take dependencies from our [webserver](https://github.com/chintansheth1711/col732_project_webserver) part for communication with the backend and from our [deduplication](https://github.com/anirudhakulkarni/de-duplication) part for storing snapshots efficiently. 
+We take dependencies from our [webserver](https://github.com/chintansheth1711/col732_project_webserver) part for communication with the backend and from our [deduplication](https://github.com/anirudhakulkarni/de-duplication) part for storing snapshots efficiently. Comprehensive report can be found [here] (demo/report) and final presentation [here] (https://csciitd-my.sharepoint.com/:p:/g/personal/cs5190421_iitd_ac_in/Ef0S-aVN80xNozJ0SArbvf4BwsbbDXQexnmG0p2YNFUJxg?e=JtQEOV) 
 Here are the 3 basic functionalities provided:- 
 
 1. ### Starting an VM
