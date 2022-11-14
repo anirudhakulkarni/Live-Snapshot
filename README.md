@@ -32,7 +32,8 @@
       </ul>
     </li>
     <li><a href="#usage">Usage</a></li>
-    <li><a href="#usage">Result</a></li>
+    <li><a href="#demo">Demo</a></li>
+    <li><a href="#result">Result</a></li>
     <li><a href="#license">License</a></li>
   </ol>
 </details>
