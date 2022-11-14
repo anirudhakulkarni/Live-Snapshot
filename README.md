@@ -138,6 +138,10 @@ cargo run -- --kernel path=bzimage_final8 --port 10010 --cpu_path cpu.txt --memo
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
 
 
+## Demo
+We demonstrate ability to pause and resume a Linux VM (focal fossa) running on a KVM hypervisor. We start a VM from a bzimage. We start a python script that prints a progress bar and then take a snapshot of the VM. We then transfer the state of the VM via USB to another machine and resume our snapshot from there. We then exit the VM. The previous commands, disk and output continues as previously. You may find the original video [link](https://youtu.be/Hi0ueb6cBV4)
+
+![](docs/demo.gif)
 ## Results
 
 On i79750-H processor with 8GB RAM here are the benchmarks for a VM having 2 CPUs and 256MB RAM:- 
